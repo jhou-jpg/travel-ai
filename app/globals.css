@@ -1,26 +1,90 @@
 @import "tailwindcss";
 
-:root {
-  --background: #ffffff;
-  --foreground: #171717;
-}
-
 @theme inline {
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
-}
+  /* Terracotta editorial palette */
+  --color-primary: #8f482a;
+  --color-primary-container: #ad603f;
+  --color-primary-fixed: #ffdbce;
+  --color-primary-fixed-dim: #ffb598;
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
-  }
+  --color-secondary: #7c5546;
+  --color-secondary-container: #ffccb9;
+
+  --color-tertiary: #006763;
+  --color-tertiary-container: #00837d;
+
+  --color-surface: #fbf9f6;
+  --color-surface-dim: #1a1714;
+  --color-surface-container: #efeeeb;
+  --color-surface-container-low: #f5f3f0;
+  --color-surface-container-high: #eae8e5;
+  --color-surface-container-highest: #e4e2df;
+  --color-surface-variant: #e4e2df;
+
+  --color-on-surface: #1b1c1a;
+  --color-on-surface-variant: #54433d;
+  --color-on-primary: #ffffff;
+
+  --color-outline: #87736c;
+  --color-outline-variant: #d9c1b9;
+
+  --color-error: #ba1a1a;
+
+  /* Fonts */
+  --font-headline: "Noto Serif", serif;
+  --font-body: "Inter", sans-serif;
+  --font-serif: "Lora", serif;
+  --font-sans: "Inter", sans-serif;
 }
 
 body {
-  background: var(--background);
-  color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+  background-color: #1a1714;
+  color: #fbf9f6;
+  font-family: "Inter", sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+::selection {
+  background: rgba(143, 72, 42, 0.3);
+}
+
+/* Glass panel effect */
+.glass-panel {
+  background: rgba(43, 40, 37, 0.6);
+  backdrop-filter: blur(20px);
+}
+
+/* Editorial shadow */
+.editorial-shadow {
+  box-shadow: 0px 20px 40px rgba(27, 28, 26, 0.06);
+}
+
+/* Terracotta gradient */
+.terracotta-gradient {
+  background: linear-gradient(135deg, #8f482a 0%, #ad603f 100%);
+}
+
+/* Pulsing animation for processing dots */
+@keyframes pulse-dot {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.4; transform: scale(0.8); }
+}
+.pulsing-dot {
+  animation: pulse-dot 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+}
+
+/* Custom scrollbar */
+.custom-scrollbar::-webkit-scrollbar {
+  width: 4px;
+}
+.custom-scrollbar::-webkit-scrollbar-track {
+  background: transparent;
+}
+.custom-scrollbar::-webkit-scrollbar-thumb {
+  background: #d9c1b9;
+  border-radius: 10px;
+}
+.custom-scrollbar::-webkit-scrollbar-thumb:hover {
+  background: #8f482a;
 }

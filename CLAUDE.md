@@ -48,7 +48,7 @@ Layer 3: PLANNING (/lib/planning/) → /api/plan
 
 ### Environment Variables
 
-See `.env.local.example`: `ANTHROPIC_API_KEY`, `GOOGLE_MAPS_API_KEY`, `GOOGLE_VISION_API_KEY`, `UPSTASH_REDIS_REST_URL`, `UPSTASH_REDIS_REST_TOKEN`
+See `.env.local.example`: `OPENROUTER_API_KEY`, `OPENAI_API_KEY`, `GOOGLE_MAPS_API_KEY`, `NEXT_PUBLIC_GOOGLE_MAPS_API_KEY`, `SCRAPECREATORS_API_KEY`
 
 ### Path Alias
 

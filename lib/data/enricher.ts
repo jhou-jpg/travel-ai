@@ -33,7 +33,7 @@ type PlaceDetailsResult = {
 /**
  * Build a photo URL from a Google Maps photo resource name.
  */
-function photoUrl(photoName: string, apiKey: string, maxWidth = 400): string {
+function photoUrl(photoName: string, apiKey: string, maxWidth = 800): string {
   return `https://places.googleapis.com/v1/${photoName}/media?maxWidthPx=${maxWidth}&key=${apiKey}`;
 }
 

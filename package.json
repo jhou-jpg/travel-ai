@@ -9,8 +9,8 @@
     "lint": "eslint"
   },
   "dependencies": {
-    "@anthropic-ai/sdk": "^0.82.0",
     "@upstash/redis": "^1.37.0",
+    "@vis.gl/react-google-maps": "^1.8.2",
     "cheerio": "^1.2.0",
     "nanoid": "^5.1.7",
     "next": "16.2.2",

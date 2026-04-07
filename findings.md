@@ -1,128 +1,107 @@
 # Findings & Decisions — Travel AI
 
+## Competitive Research (2026-04-07)
+
+### Direct Competitors
+
+**Mindtrip (mindtrip.ai)** — Most polished competitor
+- "Start Anywhere": accepts screenshots, photos, PDFs, Google Maps imports, email forwarding
+- TikTok support confirmed by TechCrunch (July 2024) but unclear depth — likely caption-only
+- Collaborative boards, collections by "vibe", creator program
+- Ex-Apple/Google/LinkedIn team. Free app.
+- Source: https://techcrunch.com/2024/07/31/travel-startup-mindtrips-new-feature-lets-you-build-an-itinerary-from-a-screenshot-youtube-or-tiktok-video/
+
+**Reelstrip (reelstrip.com)** — Closest direct competitor
+- "Copy TikTok URL, paste into our app" — TikTok, Instagram Reels, YouTube Shorts
+- Browser extension for one-click save from Instagram
+- Claims to analyze "video content, captions, and audio" — but no technical specifics
+- Likely just caption parsing + Google Maps lookup
+- Source: https://reelstrip.com/tiktok-travel-planner
+
+**Airial** — Ex-Meta engineers, logistics-focused
+- "Add a link to a blog, a TikTok, or a Reel"
+- Focuses on flights, hotels, multi-city transport
+- Uses Claude Sonnet + GPT-3
+- Source: https://techcrunch.com/2025/06/30/former-meta-engineers-airial-travel-tool-helps-travelers-solve-logistics-planning-with-ai/
+
+**Layla (layla.ai)** — Absorbed Roam Around
+- Chat-based, 10M+ itineraries, live pricing for flights/hotels
+- Supports PDF/photo attachments (booking confirmations)
+- No social media URL ingestion
+
+**Wanderlog (wanderlog.com)** — Traditional planner, no AI ingestion
+- 1M+ users, ~$40/yr Pro. Drag-and-drop, collaboration, expense tracking
+- No TikTok/Instagram support at all
+
+**Wanderplan** — Dead. Domain parked for sale at $30K.
+
+### How Competitors Handle "Video Ingestion"
+**Key finding: They don't actually watch videos. They read captions.**
+
+TikTok's oEmbed API returns the caption in the `title` field + author + thumbnail. That's what most competitors parse. No evidence any shipping product does:
+- Video frame extraction
+- Audio transcription via Whisper
+- Vision analysis of signage/food/landmarks
+
+A Nexla blog post describes the real multimodal pipeline (frame sampling + Whisper + vision LLM) as a reference architecture, but no shipping consumer product implements it.
+Source: https://nexla.com/blog/ai-video-travel-itinerary-pipeline/
+
+### Our Differentiator
+Our pipeline is the only shipping implementation that actually watches the video:
+```
+Competitors:  URL → oEmbed → caption text → LLM → place names
+Us:           URL → download video → ffmpeg frames → vision model + Whisper → deep extraction
+```
+Example: Creator captions "tokyo food tour" but video shows sign "麺屋一燈" and voiceover says "Michelin-starred ramen in Shinjuku." Competitors get "tokyo food tour." We get "Menya Itto, Michelin-starred, Shinjuku."
+
+### Competitive Gaps We Need to Close
+1. **Shareable links** — every competitor has this, we don't yet
+2. **Browser extension** — Reelstrip has one-click save from TikTok/IG
+3. **Chat-based planning** — Mindtrip and Layla do this
+4. **Booking integration** — Layla and Airial link to actual bookings
+
 ## Architecture: What Actually Exists
 
-### Actual Stack (differs from original plan)
+### Actual Stack
 - **Framework:** Next.js 16 + React 19 + TypeScript strict + Tailwind CSS v4
-- **LLM:** OpenRouter API → Qwen 3.5 Flash (vision + text) — NOT Anthropic Claude
-- **Video scraping:** ScrapCreators API (TikTok + Instagram) — NOT Playwright
-- **Audio transcription:** OpenAI Whisper — not in original plan
-- **Video frames:** ffmpeg (local, frame extraction at ~0.5fps) — not in original plan
-- **URL scraping:** Cheerio (generic URLs only)
-- **Storage (planned):** Upstash Redis — not wired up yet
-- **Validation:** zod installed but NOT used yet (raw JSON regex parsing)
+- **LLM:** OpenRouter API → Qwen 3.5 Flash (vision + text)
+- **Video scraping:** ScrapCreators API (TikTok + Instagram)
+- **Audio transcription:** OpenAI Whisper
+- **Video frames:** ffmpeg (local, ~0.5fps, up to 60 frames)
+- **URL scraping:** Cheerio (generic URLs)
+- **Maps:** Google Maps Places API (New) — Text Search + Place Details
+- **Maps UI:** @vis.gl/react-google-maps (interactive, zoomable)
+- **Storage:** localStorage (client-side, no auth yet)
+- **Validation:** Zod for all LLM outputs
 
-### Actual File Map
+### Environment Variables
 ```
-app/
-  api/
-    analyze/route.ts    ← 686-line unified ingestion endpoint (WORKING)
-  page.tsx              ← 522-line UI with image upload + URL input (WORKING)
-  layout.tsx            ← Standard layout
-lib/
-  prompts/
-    screenshot-parse.ts ← SCREENSHOT_PARSE_PROMPT + URL_CONTENT_PARSE_PROMPT
-  data/                 ← EMPTY — needs schemas, place-resolver, enricher
-  ingestion/            ← EMPTY — logic lives in /api/analyze monolith
-  planning/             ← EMPTY — needs constraint-parser, itinerary-generator
+OPENROUTER_API_KEY          — LLM provider
+OPENAI_API_KEY              — Whisper transcription
+GOOGLE_MAPS_API_KEY         — Places API (server-side)
+NEXT_PUBLIC_GOOGLE_MAPS_API_KEY — Maps JS API (client-side)
+SCRAPECREATORS_API_KEY      — TikTok + Instagram data
 ```
 
-### Environment Variables (actual)
-```
-OPENROUTER_API_KEY      ← primary LLM provider
-OPENAI_API_KEY          ← Whisper transcription (optional fallback)
-GOOGLE_MAPS_API_KEY     ← not used yet, needed for Phase 3
-SCRAPECREATORS_API_KEY  ← TikTok + Instagram data extraction
-```
+### Cost Model
+- Vision (Qwen 3.5 Flash): $0.065/M input, $0.26/M output
+- Per TikTok analysis with ~15 frames: ~$0.001-0.003
+- Google Maps text search: $0.032/request
+- Google Maps place details: $0.017-0.025/request
+- Whisper: $0.006/minute audio
 
-## Ingestion Pipeline Details
+## Product Vision (2026-04-07)
 
-### TikTok Flow (working)
-```
-URL → ScrapCreators /v2/tiktok/video (get_transcript=true)
-  → caption, author, stats, video download URL, transcript
-  → Download video → ffmpeg extract frames (0.5fps, max 60)
-  → If no transcript: Whisper fallback
-  → All frames + caption + transcript → OpenRouter vision → place extraction JSON
-```
+### Current: Single-session trip builder
+Add sources → review places → generate itinerary → share link
 
-### Instagram Flow (working)
-```
-URL → ScrapCreators /v1/instagram/post
-  → caption, author, media type, images/video URL
-  → If reel: download → ffmpeg frames → Whisper transcript
-  → If carousel: download all slide images
-  → If single image: download display_url
-  → Also try /v2/instagram/media/transcript
-  → All images/frames + caption + transcript → OpenRouter vision → place extraction JSON
-```
+### Future: Mindtrip-style persistent collections + chat
+1. Users passively save TikToks/screenshots over weeks/months → builds knowledge base
+2. When planning a real trip, chat with AI that references their entire collection
+3. Conversational, iterative planning ("swap day 2 lunch", "add a cafe near Shibuya")
 
-### Generic URL Flow (working)
-```
-URL → fetch + Cheerio
-  → Extract title, description, OG image, body text (3000 char cap)
-  → If OG image: fetch + base64 → vision model
-  → Else: text model only
-  → Place extraction JSON
-```
-
-### Image Upload Flow (working)
-```
-File → base64 → data URL → vision model → place extraction JSON
-```
-
-## LLM Output Shape (current — NOT Zod-validated)
-The vision/text model returns freeform JSON, extracted via regex (`/\{[\s\S]*\}/`):
-```json
-{
-  "places": [
-    {
-      "name": "string",
-      "location_hint": "string",
-      "category": "food | accommodation | activity | ...",
-      "confidence": "high | medium | low",
-      "details": "string",
-      "source_clue": "string (vision only)"
-    }
-  ],
-  "location_context": "string",
-  "content_type": "string (vision only)",
-  "raw_text_visible": "string (vision only)",
-  "usefulness_score": 1-10,
-  "usefulness_note": "string"
-}
-```
-
-## What Needs Google Maps Integration
-
-After LLM extraction produces place names, each needs:
-1. **Text Search** → `place_id`, canonical name, address, coordinates
-2. **Place Details** → hours, rating, review_count, price_level, photos, category
-3. Places that don't resolve → keep with `verified: false`
-4. Enrichment failures → keep with `enrichment_status: 'failed'`
-
-### Google Maps Places API (New) Endpoints Needed
-- `POST https://places.googleapis.com/v1/places:searchText` — text search
-- `GET https://places.googleapis.com/v1/places/{place_id}` — place details
-
-## Quality / Hallucination Guards (planned)
-- Zod-validate all LLM outputs before passing downstream
-- Cross-check `hours` before scheduling — flag if closed on scheduled day
-- Places with no Maps match → `verified: false` (never drop)
-- Enrichment failure → `enrichment_status: 'failed'` + warning
-- Never invent addresses, phone numbers, hours — only Maps API data
-
-## Cost Model
-- Vision model (Qwen 3.5 Flash): $0.065/M input, $0.26/M output
-- Per TikTok analysis with ~15 frames: estimated $0.001–0.003
-- Google Maps text search: $0.032/request (first 100K/month)
-- Google Maps place details: $0.017/request (basic) to $0.025/request (contact/atmosphere)
-- Whisper: $0.006/minute of audio
-
-## Issues Encountered
-| Issue | Resolution |
-|-------|------------|
-| (none blocking yet) | — |
+### Approach: Polish locally first, add auth later
+Get the core experience right (ingestion quality, generation quality, sharing) before introducing user accounts and persistent storage.
 
 ---
-*Update this file after every 2 view/browser/search operations*
+*Last updated: 2026-04-07*

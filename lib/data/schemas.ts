@@ -66,3 +66,30 @@ export const EnrichedPlaceSchema = ResolvedPlaceSchema.extend({
 });
 
 export type EnrichedPlace = z.infer<typeof EnrichedPlaceSchema>;
+
+// ── Itinerary (LLM-generated day-by-day plan) ──
+
+export const ItineraryStopSchema = z.object({
+  place_name: z.string(),
+  place_id: z.string().optional(),
+  time: z.string(),
+  duration_minutes: z.number(),
+  editorial_note: z.string(),
+  label: z.string().optional(),
+});
+
+export const ItineraryDaySchema = z.object({
+  day: z.number(),
+  title: z.string(),
+  description: z.string(),
+  stops: z.array(ItineraryStopSchema),
+});
+
+export const ItinerarySchema = z.object({
+  destination: z.string(),
+  days: z.array(ItineraryDaySchema),
+});
+
+export type ItineraryStop = z.infer<typeof ItineraryStopSchema>;
+export type ItineraryDay = z.infer<typeof ItineraryDaySchema>;
+export type Itinerary = z.infer<typeof ItinerarySchema>;
