@@ -1,20 +1,16 @@
 "use client";
 
-import { useState, useCallback, useEffect, useRef } from "react";
+/* eslint-disable @typescript-eslint/no-explicit-any */
+declare const google: any;
+
+import { useState, useCallback, useEffect, useRef, useMemo } from "react";
 import { APIProvider, Map as GoogleMap, Marker, useMap } from "@vis.gl/react-google-maps";
+import CollectionSidebar from "./components/CollectionSidebar";
+import PlanPreferenceCard from "./components/PlanPreferenceCard";
+import ItineraryCard from "./components/ItineraryCard";
+import ActionChips from "./components/ActionChips";
 
 const MAPS_API_KEY = process.env.NEXT_PUBLIC_GOOGLE_MAPS_API_KEY || "";
-
-const DARK_MAP_STYLES: google.maps.MapTypeStyle[] = [
-  { elementType: "geometry", stylers: [{ color: "#2a2520" }] },
-  { elementType: "labels.text.fill", stylers: [{ color: "#9a8a7c" }] },
-  { elementType: "labels.text.stroke", stylers: [{ color: "#1a1714" }] },
-  { featureType: "water", elementType: "geometry", stylers: [{ color: "#1a1714" }] },
-  { featureType: "road", elementType: "geometry", stylers: [{ color: "#3a3530" }] },
-  { featureType: "road.highway", elementType: "geometry", stylers: [{ color: "#4a4540" }] },
-  { featureType: "poi", stylers: [{ visibility: "off" }] },
-  { featureType: "transit", stylers: [{ visibility: "off" }] },
-];
 
 // ── Types ──
 
@@ -44,15 +40,6 @@ type EnrichedPlace = {
   open_now?: boolean;
 };
 
-type TripSource = {
-  id: string;
-  type: "url" | "image";
-  label: string;
-  addedAt: number;
-  placeCount: number;
-  mode: string;
-};
-
 type ItineraryStop = {
   place_name: string;
   place_id?: string;
@@ -74,14 +61,47 @@ type Itinerary = {
   days: ItineraryDay[];
 };
 
-type TripState = {
-  sources: TripSource[];
-  places: EnrichedPlace[];
+type ProcessingStep = {
+  label: string;
+  status: "done" | "running" | "pending";
 };
 
-type View = "ingestion" | "processing" | "review" | "itinerary";
+type ChatMessage = {
+  id: string;
+  role: "user" | "assistant";
+  content: string;
+  timestamp: number;
+  places?: EnrichedPlace[];
+  processing?: ProcessingStep[];
+  itinerary?: Itinerary;
+  attachment?: { type: "url" | "image"; value: string };
+  planPrompt?: boolean;
+  destinationPhoto?: string;
+};
+
+type TripSource = {
+  id: string;
+  type: "url" | "image";
+  label: string;
+  addedAt: number;
+  placeCount: number;
+  mode: string;
+};
+
+type CollectionPlace = EnrichedPlace & { sourceType?: string };
+
+// ── Helpers ──
 
 const STORAGE_KEY = "travel-ai-trip";
+const CHAT_STORAGE_KEY = "travel-ai-chat-v2";
+const URL_REGEX = /https?:\/\/[^\s]+/;
+const PLAN_INTENT_REGEX = /\b(plan|itinerary|schedule|organize|generate|create|build|make)\b.*\b(trip|day|itinerary|travel|route|plan)\b/i;
+
+function detectSourceType(url: string): "tiktok" | "instagram" | "link" {
+  if (/tiktok\.com/i.test(url)) return "tiktok";
+  if (/instagram\.com/i.test(url)) return "instagram";
+  return "link";
+}
 
 function generateId() {
   return Math.random().toString(36).slice(2, 10);
@@ -94,10 +114,7 @@ function placeKey(p: EnrichedPlace): string {
   return `name:${name}|${hint}`;
 }
 
-function mergePlaces(
-  existing: EnrichedPlace[],
-  incoming: EnrichedPlace[]
-): EnrichedPlace[] {
+function mergePlaces(existing: EnrichedPlace[], incoming: EnrichedPlace[]): EnrichedPlace[] {
   const seen = new Map<string, EnrichedPlace>();
   for (const p of existing) seen.set(placeKey(p), p);
   for (const p of incoming) {
@@ -106,21 +123,14 @@ function mergePlaces(
     if (!prev) {
       seen.set(key, p);
     } else {
-      // Combine insights from duplicate sources
-      const combinedDetails = [prev.details, p.details]
-        .filter(Boolean)
-        .join(" | ");
-      const combinedClues = [prev.source_clue, p.source_clue]
-        .filter(Boolean)
-        .join(" | ");
+      const combinedDetails = [prev.details, p.details].filter(Boolean).join(" | ");
+      const combinedClues = [prev.source_clue, p.source_clue].filter(Boolean).join(" | ");
       seen.set(key, {
         ...prev,
-        // Prefer richer data (verified > unverified, success > failed)
         ...(p.verified && !prev.verified ? p : {}),
         ...(p.enrichment_status === "success" && prev.enrichment_status !== "success" ? p : {}),
         details: combinedDetails || prev.details,
         source_clue: combinedClues || prev.source_clue,
-        // Keep the better photo
         photo_url: prev.photo_url || p.photo_url,
       });
     }
@@ -128,822 +138,7 @@ function mergePlaces(
   return Array.from(seen.values());
 }
 
-function loadTrip(): TripState {
-  if (typeof window === "undefined") return { sources: [], places: [] };
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    if (raw) return JSON.parse(raw);
-  } catch {
-    /* ignore */
-  }
-  return { sources: [], places: [] };
-}
-
-function saveTrip(state: TripState) {
-  try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
-  } catch {
-    /* ignore */
-  }
-}
-
-// ── Sidebar ──
-
-const NAV_ITEMS: { key: View; icon: string; label: string }[] = [
-  { key: "ingestion", icon: "input", label: "Ingestion" },
-  { key: "processing", icon: "settings_suggest", label: "Processing" },
-  { key: "review", icon: "rate_review", label: "Review" },
-  { key: "itinerary", icon: "map", label: "Itinerary" },
-];
-
-function Sidebar({
-  activeView,
-  onNavigate,
-  onNewTrip,
-  hasPlaces,
-}: {
-  activeView: View;
-  onNavigate: (v: View) => void;
-  onNewTrip: () => void;
-  hasPlaces: boolean;
-}) {
-  return (
-    <aside className="h-screen w-64 sticky left-0 top-0 bg-stone-900 flex flex-col py-10 gap-8 flex-shrink-0">
-      <div className="px-8">
-        <h1 className="font-headline text-lg text-stone-50">Trip Planner</h1>
-        <p className="text-[10px] tracking-widest uppercase text-stone-400 mt-1">
-          Crafting your journey
-        </p>
-      </div>
-
-      <nav className="flex flex-col flex-grow">
-        {NAV_ITEMS.map((item) => {
-          const isActive = activeView === item.key;
-          const isDisabled =
-            (item.key === "review" || item.key === "itinerary") && !hasPlaces;
-          return (
-            <button
-              key={item.key}
-              onClick={() => !isDisabled && onNavigate(item.key)}
-              disabled={isDisabled}
-              className={`flex items-center px-8 py-4 gap-4 text-left transition-all duration-200 ${
-                isActive
-                  ? "text-primary-fixed-dim font-bold border-r-4 border-primary-fixed-dim bg-stone-950/30"
-                  : isDisabled
-                    ? "text-stone-700 cursor-not-allowed"
-                    : "text-stone-400 hover:bg-stone-800/50 hover:text-stone-200 cursor-pointer"
-              }`}
-            >
-              <span className="material-symbols-outlined text-[20px]">
-                {item.icon}
-              </span>
-              <span className="text-xs tracking-widest uppercase">
-                {item.label}
-              </span>
-            </button>
-          );
-        })}
-      </nav>
-
-      <div className="px-6">
-        <button
-          onClick={onNewTrip}
-          className="w-full py-4 rounded-xl terracotta-gradient text-white font-medium tracking-wide transition-opacity hover:opacity-90 text-sm"
-        >
-          New Expedition
-        </button>
-      </div>
-    </aside>
-  );
-}
-
-// ── Place Card ──
-
-function PlaceCard({
-  place,
-  onRemove,
-}: {
-  place: EnrichedPlace;
-  onRemove?: () => void;
-}) {
-  return (
-    <div
-      className={`glass-panel p-5 rounded-xl border group transition-all hover:border-primary/30 ${
-        place.verified ? "border-stone-800/30" : "border-yellow-800/30"
-      }`}
-    >
-      <div className="flex items-start gap-4">
-        {place.photo_url && (
-          /* eslint-disable-next-line @next/next/no-img-element */
-          <img
-            src={place.photo_url}
-            alt={place.canonical_name || place.name}
-            className="w-16 h-16 rounded-lg object-cover flex-shrink-0"
-          />
-        )}
-        <div className="flex-1 min-w-0">
-          <div className="flex items-start justify-between gap-2">
-            <div>
-              {place.location_hint && (
-                <span className="text-[10px] uppercase tracking-widest text-primary-fixed-dim font-bold block mb-1">
-                  {place.location_hint}
-                </span>
-              )}
-              <h4 className="font-headline text-lg text-stone-100">
-                {place.maps_url ? (
-                  <a
-                    href={place.maps_url}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="hover:text-primary-fixed-dim transition-colors"
-                  >
-                    {place.canonical_name || place.name}
-                  </a>
-                ) : (
-                  place.name
-                )}
-              </h4>
-              {place.address && (
-                <p className="text-xs text-stone-500 truncate mt-0.5">
-                  {place.address}
-                </p>
-              )}
-            </div>
-            {onRemove && (
-              <button
-                onClick={onRemove}
-                className="text-stone-700 hover:text-red-400 transition opacity-0 group-hover:opacity-100"
-              >
-                <span className="material-symbols-outlined text-[18px]">
-                  close
-                </span>
-              </button>
-            )}
-          </div>
-
-          {/* Meta row */}
-          <div className="flex flex-wrap items-center gap-2 mt-2">
-            {place.rating && (
-              <span className="text-xs text-yellow-400">
-                {"★".repeat(Math.round(place.rating))} {place.rating}
-                {place.review_count && (
-                  <span className="text-stone-500">
-                    {" "}
-                    ({place.review_count.toLocaleString()})
-                  </span>
-                )}
-              </span>
-            )}
-            {place.price_level && (
-              <span className="text-xs text-stone-400">
-                {place.price_level}
-              </span>
-            )}
-            {place.open_now !== undefined && (
-              <span
-                className={`text-xs ${place.open_now ? "text-green-400" : "text-red-400"}`}
-              >
-                {place.open_now ? "Open now" : "Closed"}
-              </span>
-            )}
-            {(place.google_maps_category || place.category) && (
-              <span className="text-[10px] uppercase tracking-widest bg-stone-800/60 px-2 py-0.5 rounded text-stone-400">
-                {place.google_maps_category || place.category}
-              </span>
-            )}
-            <span
-              className={`text-[10px] uppercase tracking-widest px-2 py-0.5 rounded ${
-                place.verified
-                  ? "bg-green-900/30 text-green-400"
-                  : "bg-yellow-900/30 text-yellow-400"
-              }`}
-            >
-              {place.verified ? "verified" : "unverified"}
-            </span>
-          </div>
-
-          {place.details && (
-            <p className="text-sm text-stone-400 mt-2 line-clamp-2">
-              {place.details}
-            </p>
-          )}
-
-          {/* Links */}
-          <div className="flex gap-4 mt-3 text-xs">
-            {place.maps_url && (
-              <a
-                href={place.maps_url}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="text-primary-fixed-dim hover:text-primary-fixed transition-colors flex items-center gap-1"
-              >
-                <span className="material-symbols-outlined text-[14px]">
-                  map
-                </span>
-                Maps
-              </a>
-            )}
-            {place.website && (
-              <a
-                href={place.website}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="text-primary-fixed-dim hover:text-primary-fixed transition-colors flex items-center gap-1"
-              >
-                <span className="material-symbols-outlined text-[14px]">
-                  language
-                </span>
-                Website
-              </a>
-            )}
-            {place.phone && (
-              <span className="text-stone-500 flex items-center gap-1">
-                <span className="material-symbols-outlined text-[14px]">
-                  call
-                </span>
-                {place.phone}
-              </span>
-            )}
-          </div>
-
-          {/* Hours */}
-          {place.hours && place.hours.length > 0 && (
-            <details className="mt-2 text-xs">
-              <summary className="text-stone-500 cursor-pointer hover:text-stone-300">
-                <span className="material-symbols-outlined text-[14px] align-text-bottom mr-1">
-                  schedule
-                </span>
-                Hours
-              </summary>
-              <ul className="mt-1 space-y-0.5 text-stone-500 pl-5">
-                {place.hours.map((h, j) => (
-                  <li key={j}>{h}</li>
-                ))}
-              </ul>
-            </details>
-          )}
-        </div>
-      </div>
-    </div>
-  );
-}
-
-// ── Main Component ──
-
-export default function Home() {
-  const [view, setView] = useState<View>("ingestion");
-  const [mode, setMode] = useState<"url" | "image">("url");
-  const [url, setUrl] = useState("");
-  const [dragOver, setDragOver] = useState(false);
-  const [file, setFile] = useState<File | null>(null);
-  const [preview, setPreview] = useState<string | null>(null);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [trip, setTrip] = useState<TripState>({ sources: [], places: [] });
-  const [processingLabel, setProcessingLabel] = useState("");
-  const [duration, setDuration] = useState<number>(3);
-  const [pace, setPace] = useState<"relaxed" | "balanced" | "packed">("balanced");
-  const [itinerary, setItinerary] = useState<Itinerary | null>(null);
-  const [destinationPhoto, setDestinationPhoto] = useState<string | null>(null);
-  const [generating, setGenerating] = useState(false);
-  const initialized = useRef(false);
-
-  useEffect(() => {
-    if (!initialized.current) {
-      initialized.current = true;
-      setTrip(loadTrip());
-    }
-  }, []);
-
-  useEffect(() => {
-    if (initialized.current) saveTrip(trip);
-  }, [trip]);
-
-  const handleFile = useCallback((f: File) => {
-    if (!f.type.startsWith("image/")) {
-      setError("Please upload an image file");
-      return;
-    }
-    setFile(f);
-    setError(null);
-    const reader = new FileReader();
-    reader.onload = (e) => setPreview(e.target?.result as string);
-    reader.readAsDataURL(f);
-  }, []);
-
-  const handleDrop = useCallback(
-    (e: React.DragEvent) => {
-      e.preventDefault();
-      setDragOver(false);
-      const f = e.dataTransfer.files[0];
-      if (f) handleFile(f);
-    },
-    [handleFile]
-  );
-
-  const addSource = async () => {
-    setLoading(true);
-    setError(null);
-    setView("processing");
-
-    try {
-      let response: Response;
-      let label: string;
-
-      if (mode === "image" && file) {
-        label = file.name;
-        setProcessingLabel(label);
-        const formData = new FormData();
-        formData.append("image", file);
-        response = await fetch("/api/analyze", {
-          method: "POST",
-          body: formData,
-        });
-      } else if (mode === "url" && url.trim()) {
-        label = url.trim();
-        setProcessingLabel(label);
-        response = await fetch("/api/analyze", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ url: url.trim() }),
-        });
-      } else {
-        setError(mode === "image" ? "Upload an image first" : "Enter a URL");
-        setLoading(false);
-        setView("ingestion");
-        return;
-      }
-
-      const data = await response.json();
-      if (!response.ok) {
-        setError(data.error || "Analysis failed");
-        setView("ingestion");
-        return;
-      }
-
-      const newPlaces: EnrichedPlace[] = data.enriched_places || [];
-
-      const source: TripSource = {
-        id: generateId(),
-        type: mode,
-        label,
-        addedAt: Date.now(),
-        placeCount: newPlaces.length,
-        mode: data.mode || mode,
-      };
-
-      setTrip((prev) => ({
-        sources: [...prev.sources, source],
-        places: mergePlaces(prev.places, newPlaces),
-      }));
-
-      setUrl("");
-      setFile(null);
-      setPreview(null);
-      // Go to review if we have places, otherwise back to ingestion
-      setView(newPlaces.length > 0 ? "review" : "ingestion");
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Network error");
-      setView("ingestion");
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  const removePlace = (index: number) => {
-    setTrip((prev) => ({
-      ...prev,
-      places: prev.places.filter((_, i) => i !== index),
-    }));
-  };
-
-  const removeSource = (sourceId: string) => {
-    setTrip((prev) => ({
-      ...prev,
-      sources: prev.sources.filter((s) => s.id !== sourceId),
-    }));
-  };
-
-  const clearTrip = () => {
-    setTrip({ sources: [], places: [] });
-    setItinerary(null);
-    setDestinationPhoto(null);
-    localStorage.removeItem(STORAGE_KEY);
-    setView("ingestion");
-  };
-
-  const generateItinerary = async () => {
-    setGenerating(true);
-    setError(null);
-    setView("processing");
-    setProcessingLabel("Generating your itinerary...");
-
-    try {
-      const res = await fetch("/api/plan", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ places: trip.places, duration, pace }),
-      });
-
-      const data = await res.json();
-      if (!res.ok) {
-        setError(data.error || "Itinerary generation failed");
-        setView("review");
-        return;
-      }
-
-      setItinerary(data.itinerary);
-      setDestinationPhoto(data.destination_photo_url || null);
-      setView("itinerary");
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Network error");
-      setView("review");
-    } finally {
-      setGenerating(false);
-    }
-  };
-
-  const hasPlaces = trip.places.length > 0;
-
-  return (
-    <div className="flex min-h-screen">
-      <Sidebar
-        activeView={view}
-        onNavigate={setView}
-        onNewTrip={clearTrip}
-        hasPlaces={hasPlaces}
-      />
-
-      <main className="flex-grow overflow-y-auto custom-scrollbar">
-        {view === "ingestion" && (
-          <IngestionView
-            mode={mode}
-            setMode={setMode}
-            url={url}
-            setUrl={setUrl}
-            file={file}
-            preview={preview}
-            dragOver={dragOver}
-            setDragOver={setDragOver}
-            handleFile={handleFile}
-            handleDrop={handleDrop}
-            addSource={addSource}
-            loading={loading}
-            error={error}
-            trip={trip}
-            removeSource={removeSource}
-          />
-        )}
-        {view === "processing" && (
-          <ProcessingView label={processingLabel} />
-        )}
-        {view === "review" && (
-          <ReviewView
-            trip={trip}
-            removePlace={removePlace}
-            onAddMore={() => setView("ingestion")}
-            onGenerate={generateItinerary}
-            generating={generating}
-            duration={duration}
-            setDuration={setDuration}
-            pace={pace}
-            setPace={setPace}
-          />
-        )}
-        {view === "itinerary" && (
-          <ItineraryView
-            trip={trip}
-            itinerary={itinerary}
-            onBack={() => setView("review")}
-          />
-        )}
-      </main>
-    </div>
-  );
-}
-
-// ── Ingestion View ──
-
-function IngestionView({
-  mode,
-  setMode,
-  url,
-  setUrl,
-  file,
-  preview,
-  dragOver,
-  setDragOver,
-  handleFile,
-  handleDrop,
-  addSource,
-  loading,
-  error,
-  trip,
-  removeSource,
-}: {
-  mode: "url" | "image";
-  setMode: (m: "url" | "image") => void;
-  url: string;
-  setUrl: (u: string) => void;
-  file: File | null;
-  preview: string | null;
-  dragOver: boolean;
-  setDragOver: (d: boolean) => void;
-  handleFile: (f: File) => void;
-  handleDrop: (e: React.DragEvent) => void;
-  addSource: () => void;
-  loading: boolean;
-  error: string | null;
-  trip: TripState;
-  removeSource: (id: string) => void;
-}) {
-  return (
-    <div className="p-12 max-w-4xl mx-auto">
-      {/* Header */}
-      <header className="mb-12">
-        <div className="flex items-baseline gap-4 mb-2">
-          <span className="text-primary-fixed-dim font-bold tracking-[0.2em] text-xs uppercase">
-            Source Ingestion
-          </span>
-          <div className="h-px flex-grow bg-stone-800"></div>
-        </div>
-        <h2 className="text-5xl font-headline font-bold text-stone-50 italic tracking-tight">
-          Feed your inspiration
-        </h2>
-        <p className="mt-4 text-stone-400 max-w-xl text-lg font-light leading-relaxed">
-          Drop TikToks, Instagram reels, screenshots, or any travel link.
-          We&apos;ll extract every place and verify it on Google Maps.
-        </p>
-      </header>
-
-      {/* Mode toggle */}
-      <div className="flex gap-2 mb-6">
-        <button
-          onClick={() => setMode("url")}
-          className={`px-5 py-2.5 rounded-xl text-sm font-medium transition-all ${
-            mode === "url"
-              ? "terracotta-gradient text-white"
-              : "bg-stone-800/60 text-stone-400 hover:bg-stone-800 hover:text-stone-200"
-          }`}
-        >
-          <span className="material-symbols-outlined text-[16px] align-text-bottom mr-1">
-            link
-          </span>
-          Paste URL
-        </button>
-        <button
-          onClick={() => setMode("image")}
-          className={`px-5 py-2.5 rounded-xl text-sm font-medium transition-all ${
-            mode === "image"
-              ? "terracotta-gradient text-white"
-              : "bg-stone-800/60 text-stone-400 hover:bg-stone-800 hover:text-stone-200"
-          }`}
-        >
-          <span className="material-symbols-outlined text-[16px] align-text-bottom mr-1">
-            image
-          </span>
-          Upload Image
-        </button>
-      </div>
-
-      {/* Input */}
-      {mode === "url" ? (
-        <div className="flex gap-3">
-          <input
-            type="url"
-            placeholder="Paste a TikTok, Instagram, or travel blog URL..."
-            value={url}
-            onChange={(e) => setUrl(e.target.value)}
-            onKeyDown={(e) => e.key === "Enter" && !loading && addSource()}
-            className="flex-1 bg-stone-900/60 border border-stone-700/50 rounded-xl px-5 py-4 text-stone-100 placeholder:text-stone-600 focus:outline-none focus:border-primary/50 transition-colors"
-          />
-          <button
-            onClick={addSource}
-            disabled={loading || !url.trim()}
-            className="px-8 terracotta-gradient text-white font-medium rounded-xl transition-opacity hover:opacity-90 disabled:opacity-30 disabled:cursor-not-allowed"
-          >
-            {loading ? (
-              <span className="material-symbols-outlined animate-spin text-[20px]">
-                progress_activity
-              </span>
-            ) : (
-              "Add"
-            )}
-          </button>
-        </div>
-      ) : (
-        <>
-          <div
-            onDragOver={(e) => {
-              e.preventDefault();
-              setDragOver(true);
-            }}
-            onDragLeave={() => setDragOver(false)}
-            onDrop={handleDrop}
-            onClick={() => document.getElementById("file-input")?.click()}
-            className={`border-2 border-dashed rounded-xl p-12 text-center cursor-pointer transition-all ${
-              dragOver
-                ? "border-primary bg-primary/5"
-                : "border-stone-700/50 hover:border-stone-600"
-            }`}
-          >
-            <input
-              id="file-input"
-              type="file"
-              accept="image/*"
-              className="hidden"
-              onChange={(e) => {
-                const f = e.target.files?.[0];
-                if (f) handleFile(f);
-              }}
-            />
-            {preview ? (
-              <div className="flex flex-col items-center gap-4">
-                {/* eslint-disable-next-line @next/next/no-img-element */}
-                <img
-                  src={preview}
-                  alt="Preview"
-                  className="max-h-48 rounded-lg"
-                />
-                <p className="text-sm text-stone-500">
-                  Click or drag to replace
-                </p>
-              </div>
-            ) : (
-              <div>
-                <div className="w-16 h-16 bg-stone-800 rounded-full flex items-center justify-center mx-auto mb-4">
-                  <span className="material-symbols-outlined text-primary-fixed-dim text-2xl">
-                    add_photo_alternate
-                  </span>
-                </div>
-                <p className="text-stone-300 mb-1">
-                  Drop a screenshot here or click to upload
-                </p>
-                <p className="text-sm text-stone-600">
-                  Screenshots from TikTok, Instagram, or travel content
-                </p>
-              </div>
-            )}
-          </div>
-          {file && (
-            <button
-              onClick={addSource}
-              disabled={loading}
-              className="mt-4 w-full terracotta-gradient text-white font-medium py-4 rounded-xl transition-opacity hover:opacity-90 disabled:opacity-50"
-            >
-              {loading ? "Analyzing..." : "Add screenshot"}
-            </button>
-          )}
-        </>
-      )}
-
-      {/* Error */}
-      {error && (
-        <div className="mt-4 p-4 bg-red-900/20 border border-red-800/30 rounded-xl text-red-300 text-sm flex items-center gap-2">
-          <span className="material-symbols-outlined text-[18px]">error</span>
-          {error}
-        </div>
-      )}
-
-      {/* Sources list */}
-      {trip.sources.length > 0 && (
-        <div className="mt-12">
-          <h3 className="text-xs uppercase tracking-[0.2em] font-bold text-stone-500 mb-4">
-            Sources Added ({trip.sources.length})
-          </h3>
-          <div className="space-y-2">
-            {trip.sources.map((source) => (
-              <div
-                key={source.id}
-                className="flex items-center justify-between px-5 py-3 glass-panel rounded-xl border border-stone-800/30"
-              >
-                <div className="flex items-center gap-3 min-w-0">
-                  <span className="material-symbols-outlined text-primary-fixed-dim text-[16px]">
-                    {source.mode === "tiktok" || source.mode === "instagram"
-                      ? "videocam"
-                      : source.type === "image"
-                        ? "image"
-                        : "link"}
-                  </span>
-                  <span className="text-[10px] px-2 py-0.5 rounded bg-stone-800 text-stone-400 uppercase tracking-widest">
-                    {source.mode}
-                  </span>
-                  <span className="text-sm text-stone-300 truncate">
-                    {source.label}
-                  </span>
-                </div>
-                <div className="flex items-center gap-3 flex-shrink-0">
-                  <span className="text-xs text-stone-500">
-                    {source.placeCount} place
-                    {source.placeCount !== 1 && "s"}
-                  </span>
-                  <button
-                    onClick={() => removeSource(source.id)}
-                    className="text-stone-700 hover:text-red-400 transition"
-                  >
-                    <span className="material-symbols-outlined text-[16px]">
-                      close
-                    </span>
-                  </button>
-                </div>
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
-    </div>
-  );
-}
-
-// ── Processing View ──
-
-function ProcessingView({ label }: { label: string }) {
-  return (
-    <div className="p-12 max-w-3xl mx-auto">
-      <header className="mb-16">
-        <div className="flex items-baseline gap-4 mb-2">
-          <span className="text-primary-fixed-dim font-bold tracking-[0.2em] text-xs uppercase">
-            Pipeline Active
-          </span>
-          <div className="h-px flex-grow bg-stone-800"></div>
-        </div>
-        <h2 className="text-5xl font-headline font-bold text-stone-50 italic tracking-tight">
-          The Magic Moment
-        </h2>
-        <p className="mt-4 text-stone-400 max-w-xl text-lg font-light leading-relaxed">
-          Analyzing your source and resolving places on Google Maps...
-        </p>
-      </header>
-
-      <div className="glass-panel p-8 rounded-xl border-b border-primary/20 mb-8">
-        <h3 className="text-primary-fixed-dim font-bold uppercase tracking-widest text-[10px] mb-8">
-          System Telemetry
-        </h3>
-        <div className="space-y-8">
-          <div className="flex items-center justify-between">
-            <div className="flex items-center gap-4">
-              <div className="w-2 h-2 rounded-full bg-primary-fixed-dim pulsing-dot"></div>
-              <span className="text-sm font-medium tracking-wide text-stone-200">
-                Fetching Content
-              </span>
-            </div>
-            <span className="text-xs font-mono text-primary-fixed-dim">
-              RUNNING
-            </span>
-          </div>
-          <div className="flex items-center justify-between">
-            <div className="flex items-center gap-4">
-              <div className="w-2 h-2 rounded-full bg-primary-fixed-dim pulsing-dot"></div>
-              <span className="text-sm font-medium tracking-wide text-stone-200">
-                Extracting Places
-              </span>
-            </div>
-            <span className="text-xs font-mono text-primary-fixed-dim">
-              RUNNING
-            </span>
-          </div>
-          <div className="flex items-center justify-between opacity-50">
-            <div className="flex items-center gap-4">
-              <div className="w-2 h-2 rounded-full bg-stone-600"></div>
-              <span className="text-sm font-medium tracking-wide">
-                Resolving on Google Maps
-              </span>
-            </div>
-            <span className="text-xs font-mono text-stone-500">PENDING</span>
-          </div>
-          <div className="flex items-center justify-between opacity-50">
-            <div className="flex items-center gap-4">
-              <div className="w-2 h-2 rounded-full bg-stone-600"></div>
-              <span className="text-sm font-medium tracking-wide">
-                Enriching Place Details
-              </span>
-            </div>
-            <span className="text-xs font-mono text-stone-500">QUEUE</span>
-          </div>
-        </div>
-      </div>
-
-      <div className="p-6 border border-stone-800/30 rounded-xl bg-stone-900/40">
-        <div className="flex items-center gap-3 mb-3">
-          <span
-            className="material-symbols-outlined text-primary-fixed-dim text-sm"
-            style={{ fontVariationSettings: "'FILL' 1" }}
-          >
-            auto_awesome
-          </span>
-          <span className="text-xs uppercase tracking-[0.15em] font-bold text-stone-300">
-            Processing
-          </span>
-        </div>
-        <p className="text-sm text-stone-400 leading-relaxed italic truncate">
-          {label}
-        </p>
-      </div>
-    </div>
-  );
-}
-
-// ── Interactive Map ──
+// ── Map Components ──
 
 function FitBounds({ places }: { places: Array<{ lat?: number; lng?: number }> }) {
   const map = useMap();
@@ -963,6 +158,814 @@ function FitBounds({ places }: { places: Array<{ lat?: number; lng?: number }> }
   return null;
 }
 
+function RoutePolyline({ places }: { places: Array<{ lat?: number; lng?: number }> }) {
+  const map = useMap();
+  useEffect(() => {
+    if (!map) return;
+    const path = places.filter((p) => p.lat && p.lng).map((p) => ({ lat: p.lat!, lng: p.lng! }));
+    if (path.length < 2) return;
+    const polyline = new google.maps.Polyline({
+      path,
+      strokeOpacity: 0,
+      icons: [{
+        icon: { path: "M 0,-1 0,1", strokeOpacity: 0.6, strokeColor: "#8f482a", scale: 3 },
+        offset: "0",
+        repeat: "16px",
+      }],
+      geodesic: true,
+    });
+    polyline.setMap(map);
+    return () => { polyline.setMap(null); };
+  }, [map, places]);
+  return null;
+}
+
+const DARK_MAP_STYLES: google.maps.MapTypeStyle[] = [
+  { elementType: "geometry", stylers: [{ color: "#2a2520" }] },
+  { elementType: "labels.text.fill", stylers: [{ color: "#9a8a7c" }] },
+  { elementType: "labels.text.stroke", stylers: [{ color: "#1a1714" }] },
+  { featureType: "water", elementType: "geometry", stylers: [{ color: "#1a1714" }] },
+  { featureType: "road", elementType: "geometry", stylers: [{ color: "#3a3530" }] },
+  { featureType: "road.highway", elementType: "geometry", stylers: [{ color: "#4a4540" }] },
+  { featureType: "poi", stylers: [{ visibility: "off" }] },
+  { featureType: "transit", stylers: [{ visibility: "off" }] },
+];
+
+// ── Main Component ──
+
+export default function Home() {
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [places, setPlaces] = useState<CollectionPlace[]>([]);
+  const [sources, setSources] = useState<TripSource[]>([]);
+  const [input, setInput] = useState("");
+  const [sending, setSending] = useState(false);
+  const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [detectedUrl, setDetectedUrl] = useState<string | null>(null);
+  const [selectedPlace, setSelectedPlace] = useState<EnrichedPlace | null>(null);
+  const [activeItinerary, setActiveItinerary] = useState<Itinerary | null>(null);
+  const [activeItineraryDay, setActiveItineraryDay] = useState(1);
+  const initialized = useRef(false);
+  const messagesEndRef = useRef<HTMLDivElement>(null);
+  const inputRef = useRef<HTMLTextAreaElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  // Load state on mount
+  useEffect(() => {
+    if (initialized.current) return;
+    initialized.current = true;
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY);
+      if (raw) {
+        const trip = JSON.parse(raw);
+        setPlaces(trip.places || []);
+        setSources(trip.sources || []);
+      }
+    } catch { /* ignore */ }
+    try {
+      const raw = localStorage.getItem(CHAT_STORAGE_KEY);
+      if (raw) {
+        // Clear any stale processing states from previous sessions
+        const loaded: ChatMessage[] = JSON.parse(raw);
+        setMessages(loaded.map((m) =>
+          m.processing
+            ? { ...m, content: "This extraction was interrupted. Try again by pasting the link.", processing: undefined }
+            : m
+        ));
+      }
+    } catch { /* ignore */ }
+  }, []);
+
+  // Persist trip
+  useEffect(() => {
+    if (!initialized.current) return;
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({ sources, places }));
+  }, [sources, places]);
+
+  // Persist chat
+  useEffect(() => {
+    if (!initialized.current || messages.length === 0) return;
+    localStorage.setItem(CHAT_STORAGE_KEY, JSON.stringify(messages));
+  }, [messages]);
+
+  // Sync to Redis
+  useEffect(() => {
+    if (!initialized.current || places.length === 0) return;
+    fetch("/api/collection", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ places }),
+    }).catch(() => {});
+  }, [places]);
+
+  // Auto-scroll
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [messages]);
+
+  // URL detection in input
+  useEffect(() => {
+    const match = input.match(URL_REGEX);
+    setDetectedUrl(match ? match[0] : null);
+  }, [input]);
+
+  // ── Ingestion (inline in chat) ──
+
+  const ingestUrl = async (url: string) => {
+    const msgId = generateId();
+    const processingId = generateId();
+
+    // Add user message with attachment
+    setMessages((prev) => [...prev, {
+      id: msgId, role: "user", content: url, timestamp: Date.now(),
+      attachment: { type: "url", value: url },
+    }]);
+
+    // Add processing message
+    setMessages((prev) => [...prev, {
+      id: processingId, role: "assistant", content: "Analyzing your link...",
+      timestamp: Date.now(),
+      processing: [
+        { label: "Fetching content", status: "running" },
+        { label: "Extracting places", status: "pending" },
+        { label: "Resolving on Google Maps", status: "pending" },
+      ],
+    }]);
+
+    setInput("");
+    setDetectedUrl(null);
+
+    // Simulate progress steps while waiting
+    const progressTimer = setTimeout(() => {
+      setMessages((prev) => prev.map((m) =>
+        m.id === processingId && m.processing
+          ? { ...m, processing: [
+              { label: "Fetching content", status: "done" },
+              { label: "Extracting places", status: "running" },
+              { label: "Resolving on Google Maps", status: "pending" },
+            ]}
+          : m
+      ));
+    }, 5000);
+    const progressTimer2 = setTimeout(() => {
+      setMessages((prev) => prev.map((m) =>
+        m.id === processingId && m.processing
+          ? { ...m, processing: [
+              { label: "Fetching content", status: "done" },
+              { label: "Extracting places", status: "done" },
+              { label: "Resolving on Google Maps", status: "running" },
+            ]}
+          : m
+      ));
+    }, 15000);
+
+    try {
+      const res = await fetch("/api/analyze", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ url }),
+      });
+      const data = await res.json();
+      clearTimeout(progressTimer);
+      clearTimeout(progressTimer2);
+
+      if (!res.ok) {
+        setMessages((prev) => prev.map((m) =>
+          m.id === processingId
+            ? { ...m, content: `Sorry, I couldn't process that link: ${data.error || "Unknown error"}`, processing: undefined }
+            : m
+        ));
+        return;
+      }
+
+      const srcType = detectSourceType(url);
+      const newPlaces: CollectionPlace[] = (data.enriched_places || []).map(
+        (p: EnrichedPlace) => ({ ...p, sourceType: srcType })
+      );
+      setPlaces((prev) => mergePlaces(prev, newPlaces));
+      setSources((prev) => [...prev, {
+        id: generateId(), type: "url", label: url,
+        addedAt: Date.now(), placeCount: newPlaces.length, mode: data.mode || "url",
+      }]);
+
+      // Replace processing message with results
+      setMessages((prev) => prev.map((m) =>
+        m.id === processingId
+          ? {
+              ...m,
+              content: newPlaces.length > 0
+                ? `I found ${newPlaces.length} place${newPlaces.length !== 1 ? "s" : ""} from that link. Here's what I extracted:`
+                : "I couldn't find any specific places in that link. Try sharing a different one, or tell me about your trip!",
+              processing: undefined,
+              places: newPlaces.length > 0 ? newPlaces : undefined,
+            }
+          : m
+      ));
+    } catch {
+      clearTimeout(progressTimer);
+      clearTimeout(progressTimer2);
+      setMessages((prev) => prev.map((m) =>
+        m.id === processingId
+          ? { ...m, content: "Sorry, something went wrong processing that link.", processing: undefined }
+          : m
+      ));
+    }
+  };
+
+  const ingestImage = async (file: File) => {
+    const msgId = generateId();
+    const processingId = generateId();
+    const preview = await new Promise<string>((resolve) => {
+      const reader = new FileReader();
+      reader.onload = (e) => resolve(e.target?.result as string);
+      reader.readAsDataURL(file);
+    });
+
+    setMessages((prev) => [...prev, {
+      id: msgId, role: "user", content: file.name, timestamp: Date.now(),
+      attachment: { type: "image", value: preview },
+    }]);
+
+    setMessages((prev) => [...prev, {
+      id: processingId, role: "assistant", content: "Analyzing your screenshot...",
+      timestamp: Date.now(),
+      processing: [
+        { label: "Processing image", status: "running" },
+        { label: "Extracting places", status: "pending" },
+        { label: "Resolving on Google Maps", status: "pending" },
+      ],
+    }]);
+
+    try {
+      const formData = new FormData();
+      formData.append("image", file);
+      const res = await fetch("/api/analyze", { method: "POST", body: formData });
+      const data = await res.json();
+
+      if (!res.ok) {
+        setMessages((prev) => prev.map((m) =>
+          m.id === processingId
+            ? { ...m, content: `Couldn't process that image: ${data.error || "Unknown error"}`, processing: undefined }
+            : m
+        ));
+        return;
+      }
+
+      const newPlaces: CollectionPlace[] = (data.enriched_places || []).map(
+        (p: EnrichedPlace) => ({ ...p, sourceType: "screenshot" as const })
+      );
+      setPlaces((prev) => mergePlaces(prev, newPlaces));
+      setSources((prev) => [...prev, {
+        id: generateId(), type: "image", label: file.name,
+        addedAt: Date.now(), placeCount: newPlaces.length, mode: data.mode || "image",
+      }]);
+
+      setMessages((prev) => prev.map((m) =>
+        m.id === processingId
+          ? {
+              ...m,
+              content: newPlaces.length > 0
+                ? `Found ${newPlaces.length} place${newPlaces.length !== 1 ? "s" : ""} from your screenshot:`
+                : "I couldn't find specific places in that image. Try another screenshot or tell me about your trip!",
+              processing: undefined,
+              places: newPlaces.length > 0 ? newPlaces : undefined,
+            }
+          : m
+      ));
+    } catch {
+      setMessages((prev) => prev.map((m) =>
+        m.id === processingId
+          ? { ...m, content: "Sorry, something went wrong processing that image.", processing: undefined }
+          : m
+      ));
+    }
+  };
+
+  // ── Chat ──
+
+  const sendMessage = async () => {
+    const text = input.trim();
+    if (!text || sending) return;
+
+    // If URL detected, ingest instead of chatting
+    if (detectedUrl && text === detectedUrl) {
+      ingestUrl(detectedUrl);
+      return;
+    }
+
+    // Check if it contains a URL — ingest and chat
+    const urlMatch = text.match(URL_REGEX);
+    if (urlMatch) {
+      ingestUrl(urlMatch[0]);
+      return;
+    }
+
+    // Check for plan intent — show preference picker
+    if (places.length > 0 && PLAN_INTENT_REGEX.test(text)) {
+      setMessages((prev) => [
+        ...prev,
+        { id: generateId(), role: "user", content: text, timestamp: Date.now() },
+        { id: generateId(), role: "assistant", content: "Let me help you plan! Choose your preferences:", timestamp: Date.now(), planPrompt: true },
+      ]);
+      setInput("");
+      return;
+    }
+
+    const userMsg: ChatMessage = {
+      id: generateId(), role: "user", content: text, timestamp: Date.now(),
+    };
+    setMessages((prev) => [...prev, userMsg]);
+    setInput("");
+    setSending(true);
+
+    try {
+      const res = await fetch("/api/chat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          messages: [...messages, userMsg].map((m) => ({ role: m.role, content: m.content })),
+          places,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setMessages((prev) => [...prev, {
+          id: generateId(), role: "assistant",
+          content: `Sorry, something went wrong: ${data.error || "Unknown error"}`,
+          timestamp: Date.now(),
+        }]);
+        return;
+      }
+      setMessages((prev) => [...prev, {
+        id: generateId(), role: "assistant", content: data.reply, timestamp: Date.now(),
+      }]);
+    } catch {
+      setMessages((prev) => [...prev, {
+        id: generateId(), role: "assistant",
+        content: "Sorry, I couldn't connect. Please try again.",
+        timestamp: Date.now(),
+      }]);
+    } finally {
+      setSending(false);
+      inputRef.current?.focus();
+    }
+  };
+
+  const handleKeyDown = (e: React.KeyboardEvent) => {
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      sendMessage();
+    }
+  };
+
+  const handleDrop = useCallback((e: React.DragEvent) => {
+    e.preventDefault();
+    const f = e.dataTransfer.files[0];
+    if (f && f.type.startsWith("image/")) ingestImage(f);
+  }, []);
+
+  const clearAll = () => {
+    setMessages([]);
+    setPlaces([]);
+    setSources([]);
+    setSelectedPlace(null);
+    setActiveItinerary(null);
+    localStorage.removeItem(STORAGE_KEY);
+    localStorage.removeItem(CHAT_STORAGE_KEY);
+  };
+
+  const showPlanPrompt = () => {
+    setMessages((prev) => [...prev, {
+      id: generateId(), role: "assistant",
+      content: "Let's build your itinerary! Choose your preferences:",
+      timestamp: Date.now(), planPrompt: true,
+    }]);
+  };
+
+  const generateItinerary = async (duration: number, pace: "relaxed" | "balanced" | "packed") => {
+    const processingId = generateId();
+
+    // Remove the plan prompt message, add processing
+    setMessages((prev) => [
+      ...prev.map((m) => m.planPrompt ? { ...m, planPrompt: false, content: `Planning a ${duration}-day ${pace} trip...` } : m),
+      {
+        id: processingId, role: "assistant" as const,
+        content: "Building your itinerary...",
+        timestamp: Date.now(),
+        processing: [
+          { label: "Analyzing places", status: "running" as const },
+          { label: "Optimizing route", status: "pending" as const },
+          { label: "Writing editorial notes", status: "pending" as const },
+        ],
+      },
+    ]);
+
+    const progressTimer = setTimeout(() => {
+      setMessages((prev) => prev.map((m) =>
+        m.id === processingId && m.processing
+          ? { ...m, processing: [
+              { label: "Analyzing places", status: "done" as const },
+              { label: "Optimizing route", status: "running" as const },
+              { label: "Writing editorial notes", status: "pending" as const },
+            ]}
+          : m
+      ));
+    }, 5000);
+
+    try {
+      const res = await fetch("/api/plan", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ places, duration, pace }),
+      });
+      const data = await res.json();
+      clearTimeout(progressTimer);
+
+      if (!res.ok) {
+        setMessages((prev) => prev.map((m) =>
+          m.id === processingId
+            ? { ...m, content: `Sorry, couldn't generate the itinerary: ${data.error || "Unknown error"}`, processing: undefined }
+            : m
+        ));
+        return;
+      }
+
+      const itinerary: Itinerary = data.itinerary;
+      setActiveItinerary(itinerary);
+      setActiveItineraryDay(1);
+
+      setMessages((prev) => prev.map((m) =>
+        m.id === processingId
+          ? {
+              ...m,
+              content: `Here's your ${duration}-day itinerary for ${itinerary.destination}:`,
+              processing: undefined,
+              itinerary,
+              destinationPhoto: data.destination_photo_url || undefined,
+            }
+          : m
+      ));
+    } catch {
+      clearTimeout(progressTimer);
+      setMessages((prev) => prev.map((m) =>
+        m.id === processingId
+          ? { ...m, content: "Sorry, something went wrong generating the itinerary.", processing: undefined }
+          : m
+      ));
+    }
+  };
+
+  const shareTrip = async () => {
+    if (!activeItinerary) return;
+    try {
+      const res = await fetch("/api/share", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ itinerary: activeItinerary, places }),
+      });
+      const data = await res.json();
+      if (res.ok && data.slug) {
+        const shareUrl = `${window.location.origin}/trip/${data.slug}`;
+        navigator.clipboard.writeText(shareUrl);
+        setMessages((prev) => [...prev, {
+          id: generateId(), role: "assistant",
+          content: `Trip shared! Link copied to clipboard: ${shareUrl}`,
+          timestamp: Date.now(),
+        }]);
+      }
+    } catch { /* ignore */ }
+  };
+
+  const hasPlaces = places.length > 0;
+
+  // Map shows itinerary day stops when active, otherwise all places
+  const mapPlaces = useMemo(() => {
+    if (activeItinerary) {
+      const day = activeItinerary.days.find((d) => d.day === activeItineraryDay);
+      if (day) {
+        const placeMap = new Map<string, CollectionPlace>();
+        for (const p of places) {
+          if (p.place_id) placeMap.set(p.place_id, p);
+          placeMap.set((p.canonical_name || p.name).toLowerCase(), p);
+        }
+        return day.stops
+          .map((stop) =>
+            (stop.place_id && placeMap.get(stop.place_id)) ||
+            placeMap.get(stop.place_name.toLowerCase())
+          )
+          .filter((p): p is CollectionPlace => !!p && !!p.lat && !!p.lng);
+      }
+    }
+    return places.filter((p) => p.lat && p.lng);
+  }, [activeItinerary, activeItineraryDay, places]);
+
+  return (
+    <div className="h-screen flex flex-col">
+      {/* Top Nav */}
+      <nav className="flex justify-between items-center px-8 h-16 w-full bg-surface border-b border-outline-variant/10 flex-shrink-0 z-50">
+        <div className="text-xl font-headline italic text-on-surface">Travel AI</div>
+        <div className="flex items-center gap-4">
+          {hasPlaces && (
+            <button
+              onClick={() => setSidebarOpen(!sidebarOpen)}
+              className="lg:hidden flex items-center gap-2 px-4 py-2 text-xs font-medium uppercase tracking-widest text-on-surface-variant hover:text-primary transition-colors"
+            >
+              <span className="material-symbols-outlined text-sm">auto_stories</span>
+              {places.length} places
+            </button>
+          )}
+          {hasPlaces && (
+            <button
+              onClick={clearAll}
+              className="text-xs uppercase tracking-widest text-on-surface-variant/60 hover:text-error transition-colors"
+            >
+              New trip
+            </button>
+          )}
+          <span className="material-symbols-outlined text-primary cursor-pointer">account_circle</span>
+        </div>
+      </nav>
+
+      {/* Main layout */}
+      <div className="flex flex-1 overflow-hidden">
+        {/* Collection Sidebar — always visible on lg, toggle on mobile */}
+        <div className="hidden lg:block">
+          <CollectionSidebar
+            places={places}
+            selectedPlace={selectedPlace}
+            onPlaceClick={(p) => {
+              const match = places.find((pl) => pl.place_id === p.place_id);
+              setSelectedPlace(selectedPlace?.place_id === p.place_id ? null : match || null);
+            }}
+            onGenerateItinerary={showPlanPrompt}
+            onClose={() => setSidebarOpen(false)}
+            isMobile={false}
+          />
+        </div>
+        {sidebarOpen && (
+          <div className="lg:hidden">
+            <CollectionSidebar
+              places={places}
+              selectedPlace={selectedPlace}
+              onPlaceClick={(p) => {
+                const match = places.find((pl) => pl.place_id === p.place_id);
+                setSelectedPlace(match || null);
+                setSidebarOpen(false);
+              }}
+              onGenerateItinerary={() => { showPlanPrompt(); setSidebarOpen(false); }}
+              onClose={() => setSidebarOpen(false)}
+              isMobile={true}
+            />
+          </div>
+        )}
+
+        {/* Chat Panel */}
+        <section
+          className="flex-1 flex flex-col bg-surface relative"
+          onDragOver={(e) => e.preventDefault()}
+          onDrop={handleDrop}
+        >
+          {messages.length === 0 ? (
+            /* ── Empty State ── */
+            <div className="flex-1 flex flex-col items-center justify-center max-w-2xl mx-auto px-6 text-center">
+              <div className="mb-8">
+                <h1 className="text-4xl md:text-5xl font-headline font-bold text-on-surface tracking-tight mb-4">
+                  Where are we <span className="serif-italic text-primary">going?</span>
+                </h1>
+                <p className="text-on-surface-variant font-body leading-relaxed text-lg opacity-80">
+                  Drop a link, upload a screenshot, or just start typing.
+                </p>
+              </div>
+              <div className="flex flex-wrap justify-center gap-3 mb-12">
+                {[
+                  { icon: "video_library", label: "Add a TikTok" },
+                  { icon: "image", label: "Upload a screenshot" },
+                  { icon: "chat", label: "Plan from scratch" },
+                ].map((chip) => (
+                  <button
+                    key={chip.label}
+                    onClick={() => {
+                      if (chip.icon === "image") fileInputRef.current?.click();
+                      else inputRef.current?.focus();
+                    }}
+                    className="px-5 py-2.5 bg-surface-container-high rounded-full text-sm font-medium hover:bg-surface-container-highest transition-colors flex items-center gap-2 text-on-surface"
+                  >
+                    <span className="material-symbols-outlined text-sm">{chip.icon}</span>
+                    {chip.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+          ) : (
+            /* ── Chat Messages ── */
+            <div className="flex-1 overflow-y-auto px-6 md:px-12 py-8 custom-scrollbar">
+              <div className="max-w-2xl mx-auto space-y-8">
+                {messages.map((msg, idx) => {
+                  const isLastAssistant = msg.role === "assistant" &&
+                    !messages.slice(idx + 1).some((m) => m.role === "assistant");
+                  return (
+                    <MessageBubble
+                      key={msg.id}
+                      msg={msg}
+                      allPlaces={places}
+                      onPlaceClick={setSelectedPlace}
+                      onGenerateItinerary={generateItinerary}
+                      onDaySelect={(day) => setActiveItineraryDay(day)}
+                      onShare={shareTrip}
+                      onRegenerate={showPlanPrompt}
+                      isLast={isLastAssistant}
+                      hasPlaces={hasPlaces}
+                      hasItinerary={!!activeItinerary}
+                      onSetInput={(text) => { setInput(text); inputRef.current?.focus(); }}
+                    />
+                  );
+                })}
+                {sending && (
+                  <div className="flex gap-4">
+                    <div className="w-8 h-8 rounded-full terracotta-gradient flex items-center justify-center flex-shrink-0">
+                      <span className="material-symbols-outlined text-white text-sm" style={{ fontVariationSettings: "'FILL' 1" }}>auto_awesome</span>
+                    </div>
+                    <div className="flex gap-1 items-center pt-2">
+                      <div className="w-1.5 h-1.5 bg-primary rounded-full pulsing-dot" />
+                      <div className="w-1.5 h-1.5 bg-primary rounded-full pulsing-dot" style={{ animationDelay: "0.3s" }} />
+                      <div className="w-1.5 h-1.5 bg-primary rounded-full pulsing-dot" style={{ animationDelay: "0.6s" }} />
+                    </div>
+                  </div>
+                )}
+                <div ref={messagesEndRef} />
+              </div>
+            </div>
+          )}
+
+          {/* Input Area */}
+          <div className="px-6 md:px-12 py-6 bg-gradient-to-t from-surface via-surface to-transparent">
+            {/* URL detection chip */}
+            {detectedUrl && (
+              <div className="max-w-2xl mx-auto mb-3">
+                <div className="inline-flex items-center gap-2 px-4 py-2 bg-primary-fixed/30 border border-primary/20 rounded-full text-xs">
+                  <span className="material-symbols-outlined text-primary text-sm">link</span>
+                  <span className="text-on-surface-variant truncate max-w-xs">{detectedUrl}</span>
+                  <span className="text-primary font-medium">Press Enter to extract places</span>
+                </div>
+              </div>
+            )}
+            <div className="max-w-2xl mx-auto glass-panel rounded-2xl px-4 py-3 flex items-end gap-3 border border-outline-variant/20 editorial-shadow">
+              <button
+                onClick={() => fileInputRef.current?.click()}
+                className="w-10 h-10 rounded-full flex items-center justify-center text-on-surface-variant hover:text-primary hover:bg-primary/5 transition-colors flex-shrink-0"
+              >
+                <span className="material-symbols-outlined">image</span>
+              </button>
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept="image/*"
+                className="hidden"
+                onChange={(e) => {
+                  const f = e.target.files?.[0];
+                  if (f) ingestImage(f);
+                  e.target.value = "";
+                }}
+              />
+              <textarea
+                ref={inputRef}
+                value={input}
+                onChange={(e) => setInput(e.target.value)}
+                onKeyDown={handleKeyDown}
+                placeholder="Paste a link, drop a screenshot, or describe your dream trip..."
+                rows={1}
+                className="flex-1 bg-transparent border-none focus:ring-0 text-on-surface text-sm font-body placeholder:text-on-surface-variant/40 resize-none max-h-32"
+              />
+              <button
+                onClick={sendMessage}
+                disabled={sending || !input.trim()}
+                className="w-10 h-10 rounded-full terracotta-gradient text-white flex items-center justify-center disabled:opacity-30 disabled:cursor-not-allowed flex-shrink-0 hover:opacity-90 transition-opacity"
+              >
+                <span className="material-symbols-outlined text-lg">arrow_upward</span>
+              </button>
+            </div>
+          </div>
+        </section>
+
+        {/* Map Panel */}
+        <section className="w-[36%] bg-on-surface relative overflow-hidden hidden lg:block border-l border-outline-variant/10 flex-shrink-0">
+          {mapPlaces.length > 0 ? (
+            MAPS_API_KEY ? (
+              <APIProvider apiKey={MAPS_API_KEY}>
+                <MapContent
+                  places={mapPlaces}
+                  selectedPlace={selectedPlace}
+                  onMarkerClick={(p) => setSelectedPlace(selectedPlace?.place_id === p.place_id ? null : p)}
+                />
+              </APIProvider>
+            ) : (
+              <MapPlaceholder message="Set NEXT_PUBLIC_GOOGLE_MAPS_API_KEY" />
+            )
+          ) : (
+            /* Empty map state */
+            <div className="h-full w-full flex items-center justify-center p-12 bg-surface-container-low">
+              <div className="text-center">
+                <div className="w-20 h-20 mx-auto mb-6 flex items-center justify-center border border-outline/20 rounded-full">
+                  <span className="material-symbols-outlined text-3xl text-outline-variant">map</span>
+                </div>
+                <h3 className="font-headline text-xl text-on-surface-variant italic">The canvas awaits.</h3>
+                <p className="text-sm text-on-surface-variant/60 font-body mt-2 tracking-widest uppercase">
+                  Start your journey to see the map
+                </p>
+              </div>
+            </div>
+          )}
+
+          {/* Map overlay info */}
+          {selectedPlace && (
+            <div className="absolute bottom-6 left-6 right-6 z-10">
+              <div className="glass-panel p-4 rounded-xl border border-outline-variant/20 editorial-shadow">
+                <div className="flex items-center gap-3">
+                  {selectedPlace.photo_url && (
+                    /* eslint-disable-next-line @next/next/no-img-element */
+                    <img src={selectedPlace.photo_url} alt="" className="w-12 h-12 rounded-lg object-cover" />
+                  )}
+                  <div className="flex-1 min-w-0">
+                    <h4 className="font-headline text-sm font-bold text-on-surface">
+                      {selectedPlace.canonical_name || selectedPlace.name}
+                    </h4>
+                    <p className="text-xs text-on-surface-variant truncate">
+                      {selectedPlace.address || selectedPlace.google_maps_category}
+                    </p>
+                  </div>
+                  {selectedPlace.rating && (
+                    <span className="text-xs text-primary font-bold">★ {selectedPlace.rating}</span>
+                  )}
+                </div>
+              </div>
+            </div>
+          )}
+        </section>
+      </div>
+    </div>
+  );
+}
+
+// ── MapContent (renders inside APIProvider so google is available) ──
+
+function MapContent({
+  places,
+  selectedPlace,
+  onMarkerClick,
+}: {
+  places: EnrichedPlace[];
+  selectedPlace: EnrichedPlace | null;
+  onMarkerClick: (p: EnrichedPlace) => void;
+}) {
+  const map = useMap();
+  if (!places.length) return null;
+
+  return (
+    <GoogleMap
+      defaultCenter={{ lat: places[0].lat!, lng: places[0].lng! }}
+      defaultZoom={12}
+      styles={DARK_MAP_STYLES}
+      disableDefaultUI={true}
+      zoomControl={true}
+      gestureHandling="greedy"
+      className="w-full h-full"
+    >
+      <FitBounds places={selectedPlace?.lat ? [] : places} />
+      {selectedPlace?.lat && selectedPlace?.lng && (
+        <ZoomToPlace lat={selectedPlace.lat} lng={selectedPlace.lng} />
+      )}
+      <RoutePolyline places={places} />
+      {places.map((place, i) => {
+        const isSelected = selectedPlace?.place_id === place.place_id;
+        return (
+          <Marker
+            key={place.place_id || `m-${i}`}
+            position={{ lat: place.lat!, lng: place.lng! }}
+            title={place.canonical_name || place.name}
+            onClick={() => onMarkerClick(place)}
+            label={{
+              text: String(i + 1),
+              color: "#fff",
+              fontSize: "11px",
+              fontWeight: "bold",
+            }}
+            icon={map && typeof google !== "undefined" ? {
+              path: 0,
+              scale: isSelected ? 14 : 11,
+              fillColor: isSelected ? "#ffb598" : "#8f482a",
+              fillOpacity: 1,
+              strokeColor: "#1a1714",
+              strokeWeight: 2,
+              labelOrigin: new google.maps.Point(0, 0),
+            } : undefined}
+          />
+        );
+      })}
+    </GoogleMap>
+  );
+}
+
+// ── ZoomToPlace ──
+
 function ZoomToPlace({ lat, lng }: { lat: number; lng: number }) {
   const map = useMap();
   useEffect(() => {
@@ -973,663 +976,198 @@ function ZoomToPlace({ lat, lng }: { lat: number; lng: number }) {
   return null;
 }
 
-function RoutePolyline({ places }: { places: Array<{ lat?: number; lng?: number }> }) {
-  const map = useMap();
-  useEffect(() => {
-    if (!map) return;
-    const path = places
-      .filter((p) => p.lat && p.lng)
-      .map((p) => ({ lat: p.lat!, lng: p.lng! }));
-    if (path.length < 2) return;
-    const polyline = new google.maps.Polyline({
-      path,
-      strokeOpacity: 0,
-      icons: [
-        {
-          icon: { path: "M 0,-1 0,1", strokeOpacity: 0.5, strokeColor: "#ad603f", scale: 3 },
-          offset: "0",
-          repeat: "16px",
-        },
-      ],
-      geodesic: true,
-    });
-    polyline.setMap(map);
-    return () => { polyline.setMap(null); };
-  }, [map, places]);
-  return null;
-}
+// ── Map Placeholder ──
 
-function TripMap({
-  places,
-  selectedPlace,
-  onMarkerClick,
-  numbered,
-  showRoute,
-}: {
-  places: EnrichedPlace[];
-  selectedPlace?: EnrichedPlace | null;
-  onMarkerClick?: (place: EnrichedPlace) => void;
-  numbered?: boolean;
-  showRoute?: boolean;
-}) {
-  const coords = places.filter((p) => p.lat && p.lng);
-  if (!MAPS_API_KEY || coords.length === 0) {
-    return (
-      <div className="w-full h-full flex items-center justify-center bg-stone-900">
-        <div className="text-center text-stone-600">
-          <span className="material-symbols-outlined text-4xl mb-2 block">map</span>
-          <p className="text-sm">{coords.length === 0 ? "No coordinates yet" : "Set NEXT_PUBLIC_GOOGLE_MAPS_API_KEY"}</p>
-        </div>
+function MapPlaceholder({ message }: { message: string }) {
+  return (
+    <div className="w-full h-full flex items-center justify-center bg-surface-container-low">
+      <div className="text-center text-on-surface-variant/60">
+        <span className="material-symbols-outlined text-4xl mb-2 block">map</span>
+        <p className="text-sm">{message}</p>
       </div>
-    );
-  }
-
-  const center = coords[0];
-
-  return (
-    <APIProvider apiKey={MAPS_API_KEY}>
-      <GoogleMap
-        defaultCenter={{ lat: center.lat!, lng: center.lng! }}
-        defaultZoom={12}
-        styles={DARK_MAP_STYLES}
-        disableDefaultUI={true}
-        zoomControl={true}
-        gestureHandling="greedy"
-        className="w-full h-full"
-      >
-        <FitBounds places={selectedPlace?.lat ? [] : coords} />
-        {selectedPlace?.lat && selectedPlace?.lng && (
-          <ZoomToPlace lat={selectedPlace.lat} lng={selectedPlace.lng} />
-        )}
-        {showRoute && <RoutePolyline places={coords} />}
-        {coords.map((place, i) => {
-          const isSelected = selectedPlace?.place_id === place.place_id;
-          return (
-            <Marker
-              key={place.place_id || `m-${i}`}
-              position={{ lat: place.lat!, lng: place.lng! }}
-              title={place.canonical_name || place.name}
-              onClick={() => onMarkerClick?.(place)}
-              label={numbered ? {
-                text: String(i + 1),
-                color: "#fff",
-                fontSize: "11px",
-                fontWeight: "bold",
-              } : undefined}
-              icon={numbered ? {
-                path: 0,
-                scale: isSelected ? 14 : 11,
-                fillColor: isSelected ? "#ffb598" : "#ad603f",
-                fillOpacity: 1,
-                strokeColor: "#1a1714",
-                strokeWeight: 2,
-                labelOrigin: new google.maps.Point(0, 0),
-              } : {
-                path: 0,
-                scale: isSelected ? 10 : 7,
-                fillColor: isSelected ? "#ffb598" : "#ad603f",
-                fillOpacity: 1,
-                strokeColor: "#1a1714",
-                strokeWeight: 2,
-              }}
-            />
-          );
-        })}
-      </GoogleMap>
-    </APIProvider>
-  );
-}
-
-// ── Review View ──
-
-function ReviewView({
-  trip,
-  removePlace,
-  onAddMore,
-  onGenerate,
-  generating,
-  duration,
-  setDuration,
-  pace,
-  setPace,
-}: {
-  trip: TripState;
-  removePlace: (i: number) => void;
-  onAddMore: () => void;
-  onGenerate: () => void;
-  generating: boolean;
-  duration: number;
-  setDuration: (d: number) => void;
-  pace: "relaxed" | "balanced" | "packed";
-  setPace: (p: "relaxed" | "balanced" | "packed") => void;
-}) {
-  const verified = trip.places.filter((p) => p.verified);
-  const unverified = trip.places.filter((p) => !p.verified);
-  const [selectedPlace, setSelectedPlace] = useState<EnrichedPlace | null>(null);
-
-  return (
-    <div className="flex flex-1 h-[calc(100vh)] overflow-hidden">
-      {/* Left column: places + constraints */}
-      <section className="w-2/5 flex flex-col overflow-y-auto custom-scrollbar p-8 gap-6">
-        {/* Header */}
-        <header>
-          <h2 className="text-3xl font-headline font-bold text-stone-50 italic tracking-tight">
-            Place Review
-          </h2>
-          <p className="text-stone-500 text-xs uppercase tracking-widest mt-1">
-            {trip.places.length} places from {trip.sources.length} sources
-          </p>
-        </header>
-
-        {/* Source groups */}
-        {trip.sources.map((source) => (
-          <div key={source.id} className="space-y-3">
-            <div className="flex items-center gap-3 border-b border-stone-800/30 pb-2">
-              <span className="material-symbols-outlined text-primary-fixed-dim text-[16px]">
-                {source.mode === "tiktok" || source.mode === "instagram"
-                  ? "videocam"
-                  : source.type === "image"
-                    ? "image"
-                    : "link"}
-              </span>
-              <h3 className="font-headline text-sm italic font-bold text-stone-400">
-                {source.mode === "tiktok"
-                  ? "TikTok"
-                  : source.mode === "instagram"
-                    ? "Instagram"
-                    : source.type === "image"
-                      ? "Screenshot"
-                      : "URL"}{" "}
-                &mdash; {source.placeCount} places
-              </h3>
-            </div>
-          </div>
-        ))}
-
-        {/* All places */}
-        {verified.length > 0 && (
-          <div className="space-y-3">
-            <div className="flex items-center gap-3 border-b border-stone-800/30 pb-2">
-              <span className="material-symbols-outlined text-green-400 text-[16px]">
-                verified
-              </span>
-              <h3 className="font-headline text-sm italic font-bold text-stone-300">
-                Verified ({verified.length})
-              </h3>
-            </div>
-            {verified.map((place, i) => {
-              const globalIndex = trip.places.indexOf(place);
-              return (
-                <div
-                  key={place.place_id || `v-${i}`}
-                  onClick={() => setSelectedPlace(selectedPlace?.place_id === place.place_id ? null : place)}
-                  className={`group glass-panel p-4 rounded-lg flex gap-4 border transition-all cursor-pointer ${
-                    selectedPlace?.place_id === place.place_id
-                      ? "border-primary/50 bg-primary/5"
-                      : "border-stone-800/20 hover:border-primary/30"
-                  }`}
-                >
-                  {place.photo_url && (
-                    /* eslint-disable-next-line @next/next/no-img-element */
-                    <img
-                      src={place.photo_url}
-                      alt={place.canonical_name || place.name}
-                      className="w-20 h-20 rounded-lg object-cover flex-shrink-0"
-                    />
-                  )}
-                  <div className="flex-1 min-w-0">
-                    <h4 className="font-headline text-base text-stone-100">
-                      {place.maps_url ? (
-                        <a href={place.maps_url} target="_blank" rel="noopener noreferrer" className="hover:text-primary-fixed-dim transition-colors">
-                          {place.canonical_name || place.name}
-                        </a>
-                      ) : place.name}
-                    </h4>
-                    <p className="text-stone-500 text-xs line-clamp-2 mt-0.5">
-                      {place.details || place.address}
-                    </p>
-                    <div className="flex flex-wrap gap-1.5 mt-2">
-                      {place.rating && (
-                        <span className="text-[10px] text-yellow-400">★ {place.rating}</span>
-                      )}
-                      {(place.google_maps_category || place.category) && (
-                        <span className="text-[10px] uppercase tracking-widest bg-stone-800/60 px-2 py-0.5 rounded text-stone-400">
-                          {place.google_maps_category || place.category}
-                        </span>
-                      )}
-                    </div>
-                  </div>
-                  <button
-                    onClick={() => removePlace(globalIndex)}
-                    className="text-stone-700 hover:text-red-400 transition opacity-0 group-hover:opacity-100 self-start"
-                  >
-                    <span className="material-symbols-outlined text-[16px]">close</span>
-                  </button>
-                </div>
-              );
-            })}
-          </div>
-        )}
-
-        {unverified.length > 0 && (
-          <div className="space-y-3">
-            <div className="flex items-center gap-3 border-b border-stone-800/30 pb-2">
-              <span className="material-symbols-outlined text-yellow-400 text-[16px]">help</span>
-              <h3 className="font-headline text-sm italic font-bold text-stone-300">
-                Unverified ({unverified.length})
-              </h3>
-            </div>
-            {unverified.map((place, i) => {
-              const globalIndex = trip.places.indexOf(place);
-              return (
-                <div
-                  key={`u-${i}`}
-                  className="group glass-panel p-4 rounded-lg flex gap-4 border border-yellow-800/20 transition-all"
-                >
-                  <div className="flex-1 min-w-0">
-                    <h4 className="font-headline text-base text-stone-100">{place.name}</h4>
-                    <p className="text-stone-500 text-xs line-clamp-2 mt-0.5">{place.details}</p>
-                  </div>
-                  <button
-                    onClick={() => removePlace(globalIndex)}
-                    className="text-stone-700 hover:text-red-400 transition opacity-0 group-hover:opacity-100 self-start"
-                  >
-                    <span className="material-symbols-outlined text-[16px]">close</span>
-                  </button>
-                </div>
-              );
-            })}
-          </div>
-        )}
-
-        {/* Constraints */}
-        <div className="mt-auto pt-6 border-t border-stone-800/30 space-y-5">
-          <div>
-            <label className="text-[10px] tracking-[0.2em] uppercase text-stone-500 font-bold mb-2 block">
-              Duration
-            </label>
-            <div className="flex bg-stone-800/60 p-1 rounded-full w-fit">
-              {[3, 5, 7].map((d) => (
-                <button
-                  key={d}
-                  onClick={() => setDuration(d)}
-                  className={`px-5 py-1.5 rounded-full text-xs transition-colors ${
-                    duration === d
-                      ? "font-bold bg-stone-700 text-stone-200 shadow-sm"
-                      : "text-stone-500 hover:text-stone-300"
-                  }`}
-                >
-                  {d} Days
-                </button>
-              ))}
-            </div>
-          </div>
-          <div>
-            <label className="text-[10px] tracking-[0.2em] uppercase text-stone-500 font-bold mb-2 block">
-              Pace
-            </label>
-            <div className="flex bg-stone-800/60 p-1 rounded-full w-fit">
-              {(["relaxed", "balanced", "packed"] as const).map((p) => (
-                <button
-                  key={p}
-                  onClick={() => setPace(p)}
-                  className={`px-5 py-1.5 rounded-full text-xs capitalize transition-colors ${
-                    pace === p
-                      ? "font-bold bg-stone-700 text-stone-200 shadow-sm"
-                      : "text-stone-500 hover:text-stone-300"
-                  }`}
-                >
-                  {p}
-                </button>
-              ))}
-            </div>
-          </div>
-          <div className="flex gap-3 pt-2">
-            <button
-              onClick={onAddMore}
-              className="flex-1 py-3 rounded-xl border border-stone-700/50 text-stone-400 text-sm hover:border-primary/50 hover:text-primary-fixed-dim transition-all flex items-center justify-center gap-2"
-            >
-              <span className="material-symbols-outlined text-[16px]">add</span>
-              Add more
-            </button>
-            <button
-              onClick={onGenerate}
-              disabled={generating}
-              className="flex-1 py-3 rounded-xl terracotta-gradient text-white font-bold text-sm tracking-wide transition-opacity hover:opacity-90 disabled:opacity-50"
-            >
-              {generating ? "..." : "Generate"}
-            </button>
-          </div>
-        </div>
-      </section>
-
-      {/* Right column: Interactive Map */}
-      <section className="w-3/5 relative overflow-hidden bg-stone-900 border-l border-stone-800/30">
-        <TripMap
-          places={trip.places}
-          selectedPlace={selectedPlace}
-          onMarkerClick={(p) => setSelectedPlace(selectedPlace?.place_id === p.place_id ? null : p)}
-        />
-        {/* Bottom info bar */}
-        <div className="absolute bottom-6 left-6 right-6 pointer-events-none">
-          <div className="glass-panel p-4 rounded-xl border border-stone-700/30 flex justify-between items-center">
-            <div className="flex gap-4 items-center">
-              <div className="bg-primary/10 p-2 rounded-lg">
-                <span className="material-symbols-outlined text-primary-fixed-dim">explore</span>
-              </div>
-              <div>
-                <h5 className="font-headline text-sm font-bold text-stone-200">
-                  {selectedPlace ? (selectedPlace.canonical_name || selectedPlace.name) : "All Places"}
-                </h5>
-                <p className="text-xs text-stone-400">
-                  {selectedPlace
-                    ? (selectedPlace.address || "Click map to deselect")
-                    : `${verified.length} verified locations`}
-                </p>
-              </div>
-            </div>
-            {selectedPlace && (
-              <button
-                onClick={() => setSelectedPlace(null)}
-                className="pointer-events-auto text-[10px] uppercase tracking-widest font-bold text-primary-fixed-dim hover:text-primary-fixed transition-colors"
-              >
-                Show all
-              </button>
-            )}
-          </div>
-        </div>
-      </section>
     </div>
   );
 }
 
-// ── Itinerary View ──
+// ── Message Bubble ──
 
-function ItineraryView({
-  trip,
-  itinerary,
-  onBack,
+function MessageBubble({
+  msg,
+  allPlaces,
+  onPlaceClick,
+  onGenerateItinerary,
+  onDaySelect,
+  onShare,
+  onRegenerate,
+  isLast,
+  hasPlaces,
+  hasItinerary,
+  onSetInput,
 }: {
-  trip: TripState;
-  itinerary: Itinerary | null;
-  onBack: () => void;
+  msg: ChatMessage;
+  allPlaces: EnrichedPlace[];
+  onPlaceClick: (p: EnrichedPlace) => void;
+  onGenerateItinerary?: (duration: number, pace: "relaxed" | "balanced" | "packed") => void;
+  onDaySelect?: (day: number) => void;
+  onShare?: () => void;
+  onRegenerate?: () => void;
+  isLast: boolean;
+  hasPlaces: boolean;
+  hasItinerary: boolean;
+  onSetInput?: (text: string) => void;
 }) {
-  const [activeDay, setActiveDay] = useState(1);
-  const [selectedStopIndex, setSelectedStopIndex] = useState<number | null>(null);
-
-  // Reset selection when switching days
-  useEffect(() => { setSelectedStopIndex(null); }, [activeDay]);
-
-  // Build a map from place name/id → enriched place for photos + links
-  const placeMap = new Map<string, EnrichedPlace>();
-  for (const p of trip.places) {
-    if (p.place_id) placeMap.set(p.place_id, p);
-    placeMap.set((p.canonical_name || p.name).toLowerCase(), p);
-    placeMap.set(p.name.toLowerCase(), p);
-  }
-
-  function findPlace(stop: ItineraryStop): EnrichedPlace | undefined {
+  if (msg.role === "user") {
     return (
-      (stop.place_id && placeMap.get(stop.place_id)) ||
-      placeMap.get(stop.place_name.toLowerCase())
-    );
-  }
-
-  if (!itinerary) {
-    return (
-      <div className="p-12 max-w-4xl mx-auto">
-        <p className="text-stone-400">No itinerary generated yet.</p>
-        <button
-          onClick={onBack}
-          className="mt-4 px-6 py-3 rounded-xl border border-stone-700/50 text-stone-400 text-sm hover:text-primary-fixed-dim transition-all"
-        >
-          Back to Review
-        </button>
-      </div>
-    );
-  }
-
-  const currentDay = itinerary.days.find((d) => d.day === activeDay) || itinerary.days[0];
-  const selectedPlace = selectedStopIndex !== null ? findPlace(currentDay.stops[selectedStopIndex]) ?? null : null;
-
-  // Scroll to selected stop when marker is clicked
-  useEffect(() => {
-    if (selectedStopIndex === null) return;
-    document.getElementById(`stop-${selectedStopIndex}`)?.scrollIntoView({ behavior: "smooth", block: "center" });
-  }, [selectedStopIndex]);
-
-  return (
-    <div className="flex h-[calc(100vh)] overflow-hidden">
-      {/* Day Nav Column */}
-      <div className="w-24 border-r border-stone-800/30 flex flex-col items-center py-12 gap-6 flex-shrink-0">
-        {/* Destination label */}
-        <div className="mb-4 text-center">
-          <span className="text-[9px] uppercase tracking-widest text-stone-600 leading-tight block">
-            {itinerary.destination}
-          </span>
-        </div>
-
-        {itinerary.days.map((day) => (
-          <button
-            key={day.day}
-            onClick={() => setActiveDay(day.day)}
-            className={`flex flex-col items-center group cursor-pointer transition-opacity ${
-              activeDay === day.day ? "" : "opacity-40 hover:opacity-100"
-            }`}
-          >
-            <span className="text-[10px] tracking-widest uppercase text-stone-500 mb-1">
-              Day
-            </span>
-            <span
-              className={`w-10 h-10 flex items-center justify-center rounded-full font-bold text-sm ${
-                activeDay === day.day
-                  ? "terracotta-gradient text-white"
-                  : "border border-stone-700 text-stone-400"
-              }`}
-            >
-              {String(day.day).padStart(2, "0")}
-            </span>
-          </button>
-        ))}
-
-        <div className="mt-auto">
-          <button
-            onClick={onBack}
-            className="text-stone-600 hover:text-stone-300 transition-colors"
-            title="Back to review"
-          >
-            <span className="material-symbols-outlined text-[20px]">
-              arrow_back
-            </span>
-          </button>
-        </div>
-      </div>
-
-      {/* Day Detail Column */}
-      <div className="flex-1 overflow-y-auto custom-scrollbar">
-        <div className="px-12 py-12 max-w-2xl mx-auto">
-          <header className="mb-14">
-            <p className="text-[10px] uppercase tracking-[0.2em] text-primary-fixed-dim font-bold mb-4">
-              Day {String(currentDay.day).padStart(2, "0")} &middot;{" "}
-              {itinerary.destination}
-            </p>
-            <h1 className="font-headline text-4xl md:text-5xl text-stone-50 italic tracking-tight leading-tight mb-6">
-              {currentDay.title}
-            </h1>
-            <p className="font-serif italic text-lg text-stone-400 leading-relaxed">
-              &ldquo;{currentDay.description}&rdquo;
-            </p>
-            <div className="flex items-center gap-4 mt-4">
-              <div className="w-12 h-px bg-outline-variant opacity-30"></div>
-              <span className="text-[10px] uppercase tracking-widest text-stone-600">
-                {currentDay.stops.length} stop{currentDay.stops.length !== 1 && "s"}
-              </span>
+      <div className="flex flex-col items-end gap-2">
+        {msg.attachment?.type === "image" && (
+          <div className="w-48 h-32 rounded-xl overflow-hidden border border-outline-variant/20">
+            {/* eslint-disable-next-line @next/next/no-img-element */}
+            <img src={msg.attachment.value} alt="" className="w-full h-full object-cover" />
+          </div>
+        )}
+        <div className="bg-surface-container-highest text-on-surface px-5 py-3 rounded-2xl rounded-tr-none max-w-md">
+          {msg.attachment?.type === "url" ? (
+            <div className="flex items-center gap-2">
+              <span className="material-symbols-outlined text-sm text-outline">link</span>
+              <span className="text-sm truncate">{msg.content}</span>
             </div>
-          </header>
-
-          {/* Stops feed */}
-          <div className="space-y-20 relative pl-6">
-            {currentDay.stops.map((stop, i) => {
-              const place = findPlace(stop);
-              const isSelected = selectedStopIndex === i;
-              return (
-                <div
-                  key={i}
-                  id={`stop-${i}`}
-                  className={`relative group cursor-pointer transition-colors rounded-lg ${isSelected ? "bg-stone-800/30" : ""}`}
-                  onClick={() => setSelectedStopIndex(isSelected ? null : i)}
-                >
-                  {/* Timeline line */}
-                  <div className={`absolute -left-6 top-0 h-full w-px transition-colors ${isSelected ? "bg-primary/40" : "bg-stone-800 group-hover:bg-primary/40"}`}></div>
-                  <div className={`absolute -left-[27px] top-1 w-3 h-3 rounded-full bg-[#1a1714] border-2 transition-all ${isSelected ? "border-[#ffb598] scale-125" : "border-primary-fixed-dim"}`}></div>
-
-                  <div className="space-y-5">
-                    {/* Time + Name + Label */}
-                    <div className="flex justify-between items-baseline gap-4">
-                      <h3 className="font-headline text-2xl text-stone-100">
-                        <span className="text-primary-fixed-dim">{stop.time}</span>
-                        {" — "}
-                        {place?.maps_url ? (
-                          <a
-                            href={place.maps_url}
-                            target="_blank"
-                            rel="noopener noreferrer"
-                            className="hover:text-primary-fixed-dim transition-colors"
-                          >
-                            {stop.place_name}
-                          </a>
-                        ) : (
-                          stop.place_name
-                        )}
-                      </h3>
-                      {stop.label && (
-                        <span className="text-[10px] uppercase tracking-widest text-stone-500 flex-shrink-0">
-                          {stop.label}
-                        </span>
-                      )}
-                    </div>
-
-                    {/* Photo */}
-                    {place?.photo_url && (
-                      <div className="w-full h-[220px] overflow-hidden rounded-lg">
-                        {/* eslint-disable-next-line @next/next/no-img-element */}
-                        <img
-                          src={place.photo_url}
-                          alt={stop.place_name}
-                          className="w-full h-full object-cover grayscale-[20%] hover:grayscale-0 hover:scale-105 transition-all duration-700"
-                        />
-                      </div>
-                    )}
-
-                    {/* Editorial note */}
-                    <blockquote className="font-serif italic text-stone-400 pl-5 border-l-2 border-primary/20 py-1 leading-relaxed">
-                      {stop.editorial_note}
-                    </blockquote>
-
-                    {/* Meta row */}
-                    {place && (
-                      <div className="flex flex-wrap items-center gap-3 text-xs text-stone-500">
-                        {place.rating && (
-                          <span className="text-yellow-400">
-                            {"★".repeat(Math.round(place.rating))}{" "}
-                            <span className="text-stone-500">{place.rating}</span>
-                          </span>
-                        )}
-                        {place.price_level && <span>{place.price_level}</span>}
-                        {place.google_maps_category && (
-                          <span className="uppercase tracking-widest text-[10px] bg-stone-800/60 px-2 py-0.5 rounded">
-                            {place.google_maps_category}
-                          </span>
-                        )}
-                        <span className="flex items-center gap-1">
-                          <span className="material-symbols-outlined text-[14px]">
-                            timer
-                          </span>
-                          {stop.duration_minutes} min
-                        </span>
-                        {place.maps_url && (
-                          <a
-                            href={place.maps_url}
-                            target="_blank"
-                            rel="noopener noreferrer"
-                            className="text-primary-fixed-dim hover:text-primary-fixed flex items-center gap-1"
-                          >
-                            <span className="material-symbols-outlined text-[14px]">
-                              map
-                            </span>
-                            Open in Maps
-                          </a>
-                        )}
-                        {place.website && (
-                          <a
-                            href={place.website}
-                            target="_blank"
-                            rel="noopener noreferrer"
-                            className="text-primary-fixed-dim hover:text-primary-fixed flex items-center gap-1"
-                          >
-                            <span className="material-symbols-outlined text-[14px]">
-                              language
-                            </span>
-                            Website
-                          </a>
-                        )}
-                      </div>
-                    )}
-
-                    {/* Combined insights from multiple sources */}
-                    {place?.details && (
-                      <p className="text-xs text-stone-500 bg-stone-900/40 px-4 py-2 rounded-lg">
-                        <span className="material-symbols-outlined text-[12px] text-primary-fixed-dim align-text-bottom mr-1">
-                          tips_and_updates
-                        </span>
-                        {place.details}
-                      </p>
-                    )}
-                  </div>
-                </div>
-              );
-            })}
-          </div>
+          ) : (
+            <p className="text-sm leading-relaxed">{msg.content}</p>
+          )}
         </div>
+        <span className="text-[10px] text-on-surface-variant/40 uppercase tracking-widest">
+          {new Date(msg.timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
+        </span>
       </div>
+    );
+  }
 
-      {/* Map Column (right) */}
-      <div className="w-80 border-l border-stone-800/30 flex flex-col flex-shrink-0">
-        <div className="p-6 border-b border-stone-800/30 glass-panel">
-          <h4 className="text-[10px] uppercase tracking-widest text-stone-500 mb-2">
-            Route Perspective
-          </h4>
-          <div className="flex items-center gap-2">
-            <span className="material-symbols-outlined text-primary-fixed-dim text-sm">explore</span>
-            <span className="text-xs font-medium text-stone-200">{itinerary.destination}</span>
+  // Assistant message
+  return (
+    <div className="flex gap-4">
+      <div className="w-8 h-8 rounded-full terracotta-gradient flex items-center justify-center flex-shrink-0">
+        <span className="material-symbols-outlined text-white text-sm" style={{ fontVariationSettings: "'FILL' 1" }}>auto_awesome</span>
+      </div>
+      <div className="flex-1 space-y-4 min-w-0">
+        <span className="text-[10px] uppercase tracking-[0.2em] text-primary font-semibold">AI Assistant</span>
+
+        {/* Processing steps */}
+        {msg.processing && (
+          <div className="space-y-3 py-3 border-t border-outline-variant/10">
+            {msg.processing.map((step, i) => (
+              <div key={i} className="flex items-center justify-between text-xs uppercase tracking-widest">
+                <div className="flex items-center gap-3">
+                  {step.status === "done" && <span className="material-symbols-outlined text-sm text-primary">check_circle</span>}
+                  {step.status === "running" && <div className="w-4 h-4 rounded-full border-2 border-primary border-t-transparent animate-spin" />}
+                  {step.status === "pending" && <div className="w-3 h-3 rounded-full bg-outline-variant/30" />}
+                  <span className={step.status === "pending" ? "text-on-surface-variant/40" : "text-on-surface"}>
+                    {step.label}
+                  </span>
+                </div>
+              </div>
+            ))}
           </div>
-        </div>
-        <div className="flex-1">
-          <TripMap
-            places={currentDay.stops
-              .map((s) => findPlace(s))
-              .filter((p): p is EnrichedPlace => !!p)}
-            selectedPlace={selectedPlace}
-            onMarkerClick={(place) => {
-              const idx = currentDay.stops.findIndex((s) => findPlace(s)?.place_id === place.place_id);
-              setSelectedStopIndex(idx >= 0 ? (idx === selectedStopIndex ? null : idx) : null);
-            }}
-            numbered
-            showRoute
+        )}
+
+        {/* Text content */}
+        {!msg.processing && (
+          <div className="text-sm text-on-surface leading-relaxed whitespace-pre-wrap">
+            <FormattedMessage content={msg.content} />
+          </div>
+        )}
+
+        {/* Plan preference picker */}
+        {msg.planPrompt && onGenerateItinerary && (
+          <PlanPreferenceCard placeCount={allPlaces.length} onGenerate={onGenerateItinerary} />
+        )}
+
+        {/* Inline itinerary card */}
+        {msg.itinerary && (
+          <ItineraryCard
+            itinerary={msg.itinerary}
+            places={allPlaces}
+            onDaySelect={onDaySelect}
+            onShare={onShare}
+            onRegenerate={onRegenerate}
           />
-        </div>
-        <div className="p-6 glass-panel border-t border-stone-800/30">
-          <div className="flex justify-between items-center text-[10px] uppercase tracking-widest text-stone-500 mb-3">
-            <span>Stops</span>
-            <span className="text-stone-200">{currentDay.stops.length}</span>
+        )}
+
+        {/* Inline place cards */}
+        {msg.places && msg.places.length > 0 && (
+          <div className="space-y-3 pt-2">
+            {msg.places.map((place, i) => (
+              <div
+                key={`${msg.id}-place-${i}`}
+                onClick={() => onPlaceClick(place)}
+                className="group flex gap-4 p-4 rounded-xl bg-surface-container-low border-b border-outline-variant/20 hover:bg-surface-container transition-colors cursor-pointer"
+              >
+                {place.photo_url && (
+                  /* eslint-disable-next-line @next/next/no-img-element */
+                  <img src={place.photo_url} alt={place.canonical_name || place.name}
+                    className="w-20 h-20 rounded-lg object-cover flex-shrink-0" />
+                )}
+                <div className="flex-1 min-w-0">
+                  <span className="text-[10px] uppercase tracking-widest text-outline font-bold">
+                    {place.google_maps_category || place.category}
+                  </span>
+                  <h3 className="font-headline text-lg text-on-surface">
+                    {place.canonical_name || place.name}
+                  </h3>
+                  <p className="text-xs text-on-surface-variant line-clamp-1 mt-0.5">
+                    {place.details || place.address}
+                  </p>
+                  <div className="flex items-center gap-3 mt-2 text-xs text-on-surface-variant">
+                    {place.rating && <span className="text-primary">★ {place.rating}</span>}
+                    {place.price_level && <span>{place.price_level}</span>}
+                    {place.verified && (
+                      <span className="text-[10px] uppercase tracking-widest text-primary/60">Verified</span>
+                    )}
+                  </div>
+                </div>
+                <div className="flex items-center">
+                  <span className="material-symbols-outlined text-primary-container opacity-0 group-hover:opacity-100 transition-opacity">
+                    arrow_forward_ios
+                  </span>
+                </div>
+              </div>
+            ))}
           </div>
-          <button className="w-full flex items-center justify-center gap-2 py-2 text-[10px] font-bold uppercase tracking-widest text-primary-fixed-dim border border-primary/20 rounded-lg hover:bg-primary/5 transition-colors">
-            <span className="material-symbols-outlined text-sm">share</span>
-            Share Trip
-          </button>
-        </div>
+        )}
+
+        {/* Contextual action chips — only on last assistant message */}
+        {isLast && !msg.processing && !msg.planPrompt && (
+          <ActionChips chips={(() => {
+            const chips: Array<{ label: string; icon: string; action: () => void }> = [];
+            if (msg.places && msg.places.length > 0 && hasPlaces) {
+              chips.push({ label: "Generate itinerary", icon: "route", action: () => onGenerateItinerary?.(3, "balanced") || onSetInput?.("plan my trip") });
+              chips.push({ label: "Add more places", icon: "add", action: () => onSetInput?.("") });
+            } else if (msg.itinerary) {
+              if (onShare) chips.push({ label: "Share trip", icon: "share", action: onShare });
+              if (onRegenerate) chips.push({ label: "Regenerate", icon: "refresh", action: onRegenerate });
+            } else if (hasPlaces && !hasItinerary) {
+              chips.push({ label: "Generate itinerary", icon: "route", action: () => onSetInput?.("plan my trip") });
+              chips.push({ label: "What's nearby?", icon: "near_me", action: () => onSetInput?.("What else is nearby my saved places?") });
+            }
+            return chips;
+          })()} />
+        )}
       </div>
     </div>
   );
 }
 
+// ── Formatted Message ──
+
+function FormattedMessage({ content }: { content: string }) {
+  const parts = content.split(/(\*\*[^*]+\*\*)/g);
+  return (
+    <>
+      {parts.map((part, i) => {
+        if (part.startsWith("**") && part.endsWith("**")) {
+          return <strong key={i} className="text-primary font-semibold">{part.slice(2, -2)}</strong>;
+        }
+        return <span key={i}>{part}</span>;
+      })}
+    </>
+  );
+}

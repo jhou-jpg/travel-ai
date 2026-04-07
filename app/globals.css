@@ -1,7 +1,7 @@
 @import "tailwindcss";
 
 @theme inline {
-  /* Terracotta editorial palette */
+  /* Terracotta editorial palette — Light mode */
   --color-primary: #8f482a;
   --color-primary-container: #ad603f;
   --color-primary-fixed: #ffdbce;
@@ -14,7 +14,7 @@
   --color-tertiary-container: #00837d;
 
   --color-surface: #fbf9f6;
-  --color-surface-dim: #1a1714;
+  --color-surface-dim: #dbdad7;
   --color-surface-container: #efeeeb;
   --color-surface-container-low: #f5f3f0;
   --color-surface-container-high: #eae8e5;
@@ -31,27 +31,27 @@
   --color-error: #ba1a1a;
 
   /* Fonts */
-  --font-headline: "Noto Serif", serif;
+  --font-headline: "Noto Serif", "Lora", serif;
   --font-body: "Inter", sans-serif;
   --font-serif: "Lora", serif;
   --font-sans: "Inter", sans-serif;
 }
 
 body {
-  background-color: #1a1714;
-  color: #fbf9f6;
+  background-color: #fbf9f6;
+  color: #1b1c1a;
   font-family: "Inter", sans-serif;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
 }
 
 ::selection {
-  background: rgba(143, 72, 42, 0.3);
+  background: rgba(143, 72, 42, 0.2);
 }
 
-/* Glass panel effect */
+/* Glass panel — light variant */
 .glass-panel {
-  background: rgba(43, 40, 37, 0.6);
+  background: rgba(255, 255, 255, 0.8);
   backdrop-filter: blur(20px);
 }
 
@@ -74,12 +74,12 @@ body {
   animation: pulse-dot 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
 }
 
-/* Custom scrollbar */
+/* Custom scrollbar — light */
 .custom-scrollbar::-webkit-scrollbar {
   width: 4px;
 }
 .custom-scrollbar::-webkit-scrollbar-track {
-  background: transparent;
+  background: #f5f3f0;
 }
 .custom-scrollbar::-webkit-scrollbar-thumb {
   background: #d9c1b9;
@@ -88,3 +88,15 @@ body {
 .custom-scrollbar::-webkit-scrollbar-thumb:hover {
   background: #8f482a;
 }
+
+/* No-scrollbar utility */
+.no-scrollbar::-webkit-scrollbar { display: none; }
+.no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
+
+/* Serif italic helper */
+.serif-italic {
+  font-family: "Noto Serif", serif;
+  font-style: italic;
+}
+
+/* Dark map styles (applied via JS) */
